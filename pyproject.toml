@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d3-bidirectional-study"
+version = "0.1.0"
+description = "Bidirectional trajectory Best-of-3 empirical study with pinned Qwen parents and D3 selectors"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.32,<3", "huggingface-hub>=0.34,<2"]
+
+[project.optional-dependencies]
+data = ["datasets>=3,<6"]
+generator = ["vllm"]
+decision = ["transformers==5.17.0", "torch", "torchvision", "accelerate", "safetensors", "pillow", "opencv-python-headless"]
+evaluation = ["swebench==5.0.2"]
+
+[project.scripts]
+d3study = "d3study.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+d3study = ["prompts/*.txt"]

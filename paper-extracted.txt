@@ -1,0 +1,2939 @@
+SWE-VERIFIER: Selective Verification for Cost-Efficient Coding Agents
+Kaijian Zou1* Vaibhav Chennareddy1 Yunxiang Zhang1 Naihao Deng1
+Longju Bai1 Jiaxin Pei2 Rada Mihalcea1 Lu Wang1
+1University of Michigan 2The University of Texas at Austin
+Abstract
+Coding agents spend substantial computation
+generating actions and processing long inter-
+action histories. Poor action choices can steer
+agents into low-value states, wasting computa-
+tion and increasing API costs. Sampling and
+verifying alternative actions can improve the
+agent’s decisions, but applying this procedure
+at every step adds substantial overhead. We in-
+troduce SWE-VERIFIER, a lightweight gener-
+ative model that selectively triggers candidate
+sampling and verification. It scores the cod-
+ing agent’s proposed action to determine when
+additional candidate sampling is needed, then
+ranks the resulting actions before execution.
+We train SWE-VERIFIERfrom Qwen3.5-4B
+using preference data that groups contrasting
+actions with their resulting environment obser-
+vations and rubric-guided teacher scores. Using
+the mini-swe-agent harness, SWE-VERIFIER
+improves resolution from 75.47% to 77.20%
+on MiniMax-M2.7 at 1.09× cost and general-
+izes to DeepSeek-V4-Flash without training on
+its actions, improving resolution from 72.60%
+to 74.27% at 1.13 × cost. Across both mod-
+els, SWE-VERIFIERverifies fewer than 4% of
+steps and achieves comparable or higher res-
+olution than the trajectory and all-step base-
+lines at substantially lower cost. These results
+demonstrate that selective candidate sampling
+and lightweight verification provide comple-
+mentary gains in coding-agent performance and
+inference efficiency. Our model, code, and
+data are available at https://github.com/
+zkjzou/SWE-Verifier.
+1 Introduction
+Coding agents powered by large language models
+(LLMs) solve software-engineering tasks through
+sequences of actions such as repository inspection,
+code edits, tool execution, and validation (Jimenez
+et al., 2024; Yang et al., 2024; Wang et al., 2025c;
+*Corresponding author:zkjzou@umich.edu
+actionrejectedverificationSWE-Verifier
+No verifier
+Trajectory-level
+All-step
+Selective (ours)
+(a) Verifier calls
+(b) Δ Resolve (pts)(c) Total cost (×)
+No verifier
+Trajectory-level
+All-step
+Selective (ours)
+0.00
++0.38
+−0.20
++1.73
+0 1 2
+1.00×
+3.50×
+3.35×
+1.09×
+0 1 2 3 4
+Figure 1: Verification strategies for coding agents on the full
+500-task SWE-Bench Verified set. (a) Trajectory-level verifi-
+cation selects among completed rollouts, all-step verification
+compares candidates at every step, and selective verification
+compares candidates only at selected steps. (b) Resolution
+gains and (c) total costs on MiniMax-M2.7: SWE-VERIFIER
+improves resolution by 1.73 percentage points at 1.09× total
+cost. Both are relative to the no-verifier baseline.
+Xia et al., 2025). While the final patch is the ul-
+timate measure of success, the actions leading to
+it shape both solution quality and computational
+efficiency. A poor action can steer the agent into
+a low-value trajectory, requiring additional explo-
+ration and corrective work. These detours are ex-
+pensive: later actions repeatedly process an ex-
+panding interaction history, and input and cached-
+context tokens can account for a substantial por-
+tion of coding-agent costs (Bai et al., 2026; Salim
+et al., 2026; Wang et al., 2025b; Fan et al., 2025).
+Improving action quality before execution is there-
+fore an opportunity to improve both task success
+and inference efficiency.
+Verification offers a way to allocate additional
+computation to better decisions. Existing test-time
+scaling methods apply this idea by adjusting rea-
+soning effort or selecting among independently
+1
+arXiv:2610.30284v1  [cs.LG]  21 Oct 2026
+
+sampled solutions (Snell et al., 2025; Brown et al.,
+2024; Lightman et al., 2024). For coding agents,
+outcome-level and trajectory-level verifiers simi-
+larly rank completed patches or rollouts (Pan et al.,
+2025; Jain et al., 2025; Han et al., 2026; Zainul-
+lina et al., 2025; Gandhi et al., 2025; Dihan and
+Khan, 2026; Shum et al., 2025). However, selec-
+tion after completion cannot prevent an individual
+rollout from taking an unproductive branch, and
+every candidate trajectory must be generated be-
+fore it can be judged. This motivates verification
+at intermediate decision points, before the agent
+commits to its next action.
+Step-level verification samples alternative ac-
+tions from the current agent state and uses a verifier
+to choose which one to execute (Figure 1).Existing
+coding-agent process verifiers often rely on noisy
+step labels propagated from final outcomes and ap-
+ply verification at every step (Han et al., 2026; Zain-
+ullina et al., 2025; Gandhi et al., 2025; Dihan and
+Khan, 2026). Applying this procedure at every step,
+however, incurs candidate-generation and scoring
+overhead throughout the trajectory, typically using
+the coding agent itself as the verifier. Not every de-
+cision warrants this expense. We therefore studyse-
+lective step-level verification: assess the proposed
+action first, then generate and compare alternatives
+only when additional scrutiny is useful. The cen-
+tral challenge isbalancing task accuracy against
+compute budget by deciding which coding-agent
+actions warrant additional verification.
+We formalize step-level action selection and
+decompose its policy and verifier costs to com-
+pare full and selective verification with trajectory-
+level scaling. A preliminary study with MiniMax-
+M2.7 (MiniMax, 2026) on SWE-Bench-Verified
+(Jimenez et al., 2024) shows that selective verifi-
+cation outperforms all-step verification, achieving
+similar task performance (76.6% versus 76.0%)
+while significantly reduce the compute cost (1.29×
+versus 2.32× baseline cost) by verifying only 4%
+of steps. These observations motivate two com-
+plementary design choices to save computing bud-
+get: concentrate candidate comparison at useful
+decision points and offload action evaluation to
+a lightweight model.
+Motivated by these findings, we introduce SWE-
+VERIFIER, a framework for selective verification of
+coding-agent actions. A single generative verifier
+scores the policy’s proposed action to determine
+whether to sample alternatives, then scores the re-
+sulting candidates to select the action to execute.
+We instantiate SWE-VERIFIERwith Qwen3.5-4B
+(Qwen Team, 2026) and train it using an execution-
+aware preference-data construction recipe. We
+sample contrasting actions from models with dif-
+ferent capabilities, including MiniMax-M2.7 and
+Qwen3.5-27B, at intermediate states drawn from
+successful trajectories generated by Opus 4.7 and
+GPT-5.5. We replay these actions to obtain en-
+vironment feedback and use GPT-5.6 to produce
+rubric-guided preference supervision for each can-
+didate group during training.
+Our experiments show that selective verifica-
+tion improves the performance–cost tradeoff across
+two policy models. On MiniMax-M2.7, SWE-
+VERIFIERraises resolution from 75.47% to 77.20%
+while verifying only 3.43% of steps and adding
+9% total cost, outperforming trajectory verifica-
+tion and both evaluated all-step verifiers. Impor-
+tantly, SWE-VERIFIERgeneralizes to DeepSeek-
+V4-Flash, improving resolution from 72.60% to
+74.27% at 1.13 × total cost. Together, these re-
+sults show that selective candidate sampling and
+lightweight action verification can improve coding-
+agent performance without the overhead of uniform
+verification at every step.
+2 Preliminary
+We formulate step-level verification for coding
+agents from complementary perspectives on ac-
+tion selection and cost.
+2.1 Conceptual Formulation
+A coding-agent trajectory is τ=
+(q, a1, o1, . . . , aT , oT ), where q is the task
+context and at and ot are the action and resulting
+observation at step t.
+Trajectory-level Verifier.Sample n complete
+trajectories and select one using an outcome ver-
+ifier Vout:
+τ ⋆ = arg max
+τi∈{τ1,...,τn}
+Vout(τi), τ i ∼π.(1)
+Selection occurs after all n trajectories have been
+completed, so the verifier cannot guide intermedi-
+ate actions (Brown et al., 2024; Kwok et al., 2026).
+Step-level Verifier.At step t, the policy π ob-
+serves history ht = (q, a 1, o1, . . . , at−1, ot−1)
+and generates n candidate actions At =
+{a(1)
+t , . . . , a(n)
+t }, with a(i)
+t ∼π(· |h t). Use an
+action verifier v to select the next action:
+a⋆
+t = arg max
+a∈At
+v(ht, a).(2)
+2
+
+τqao
+h
+o s
+a
+a
+a
+a
+hA o
+hao
+h
+a
+vhaτ a
+vhaτa vha∗
+q h
+a
+a
+a
+Figure 2: Overview of SWE-VERIFIER.(a)We construct execution-aware preference data by collecting successful trajectories,
+sampling and filtering candidate actions, replaying them for environment feedback, and obtaining rubric-guided teacher labels.
+(b)We train a Qwen3.5-4B verifier to generate outcome predictions, progress assessments, rubric evaluations, and action scores.
+(c)At inference, the verifier scores the initial action to decide whether to generate alternatives, then ranks candidates when
+verification is invoked.
+By comparing alternatives before each action,
+the verifier can improve local decisions but in-
+curs candidate-generation and scoring overhead
+throughout the trajectory (Han et al., 2026; Zain-
+ullina et al., 2025; Gandhi et al., 2025).
+Selective step-level verifier.Because not every
+step benefits equally from this additional computa-
+tion, selective verification uses a gate gt ∈ {0,1}
+to determine whether to compare candidate actions
+or execute a policy action directly:
+a⋆
+t =
+(
+arg maxa∈At v(ht, a), g t = 1,
+at, a t ∼π(· |h t), g t = 0. (3)
+Selective verification concentrates computation on
+states where comparing alternatives is expected to
+be useful. The realized verification rate is c=
+1
+T
+PT
+t=1 gt. The full action-selection derivation is
+provided in Appendix B.
+2.2 Cost Formulation
+Let x and y denote the input and output costs of
+a baseline trajectory, respectively, such thatC0 =
+x+y . We compare the costs of the verification
+strategies defined above.
+Trajectory-level verification.Selection occurs
+after rollout, so the method pays for all n com-
+plete trajectories as well as the outcome-verifier
+cost Cout:
+Ctraj ≈nC 0 +C out.(4)
+Full and selective step-level verification.Letz
+denote the fractional trajectory-length reduction, α
+the cached-input price multiplier, andβ the verifier-
+output cost relative to policy output. Full verifica-
+tion sets c= 1 and Cgate = 0; selective verification
+uses 0≤c <1 and incurs Cgate. We charge the
+first candidate the standard input price and later
+candidates the cached-input price:
+Cstep(c)≈(1−z){x[1 +αc(n−1)]
++y[1 +c(n−1)]
++c(x+βy)}+C gate.
+(5)
+For the full cost derivation, see Appendix B.1; Ta-
+ble 4 summarizes the cost accounting, and Sec-
+tion 6.3 examines pricing sensitivity.
+3 SWE-VERIFIER: Selective Step-Level
+Verification for Coding Agents
+The formulation in Section 2 highlights a central
+challenge: verification is not uniformly beneficial
+across decision states. At some steps, it provides
+no gain or can even hurt action selection, while
+at others its marginal improvement may not jus-
+tify the added candidate-generation and scoring
+cost. Our preliminary study with MiniMax-M2.7
+3
+
+illustrates this tradeoff (Table 3 in Appendix A).
+Full verification reaches 76.0% resolution at 2.32×
+total cost, with a substantial portion of the over-
+head coming from using the large policy model to
+score candidate actions. By contrast, verification
+restricted to closeout steps reaches 76.6% resolu-
+tion while verifying only 4% of steps at 1.29× cost.
+Periodic verification at a fixed frequency does not
+provide the same benefit as closeout-only verifica-
+tion, showing that effectiveness depends on which
+steps are verified. These observations motivate two
+complementary ways to reduce verification over-
+head: concentrate verification on steps where it is
+useful and offload action evaluation to a smaller
+model. Full results and experimental details ap-
+pear in Appendix A.
+Motivated by these findings, we introduce SWE-
+VERIFIER, a lightweight generative verifier for se-
+lective step-level verification. It scores the policy’s
+proposed action to determine whether additional
+verification is needed and ranks candidate actions
+to determine which one the agent should execute.
+Figure 2 summarizes the data construction, train-
+ing, and inference procedure.
+To our knowledge, SWE-VERIFIERis the first
+framework for coding agents to combine selective
+step-level verification with a trained generative ac-
+tion verifier. We further introduce an execution-
+aware construction recipe for its training data: sam-
+pling contrasting actions at each trajectory step, re-
+playing them to observe their outcomes, and using
+a strong teacher to generate rubric-guided prefer-
+ence labels for each candidate group.
+3.1 Gate and Selector Modes
+Selective verification requires two decisions with
+different roles: whether the expected value of alter-
+natives justifies generating them, and which action
+to execute once alternatives are available. We as-
+sign these decisions to gate and selector modes,
+respectively. Ingate mode, SWE-VERIFIERscores
+the policy’s initial actionat; the agent executes a
+high-scoring action directly and invokes additional
+verification when the score falls below a threshold.
+Inselector mode, it scores every action a∈A t in
+the candidate group, generating a prediction of each
+action’s likely repository effect and task progress
+before the agent executes the highest-scoring valid
+candidate. Thus, the same verifier score determines
+both when to generate alternatives and which ac-
+tion to select from them. We use Qwen3.5-4B
+(Qwen Team, 2026) as the base model and further
+improve it through the preference-data construction
+and training procedure described next.
+3.2 Preference Data Construction
+We construct the training data in four steps.
+Step 1: Collect Successful Trajectories.We
+use Opus 4.7 and GPT-5.5 as representative strong
+coding agents available at the time of our experi-
+ments. Together, they provide 500 successful tra-
+jectories from the SWE-Smith llm_rewrite and
+pr_mirror instance types.
+Step 2: Sample and Filter Candidate Actions.
+For each step in the collected trajectories, we sam-
+ple five actions from weak and strong models to
+expose the verifier to contrasting alternatives. We
+then filter candidates based on their pairwise Jac-
+card similarity,
+J(a, b) = |S(a)∩S(b)|
+|S(a)∪S(b)| .(6)
+Here, S(a) denotes the set of tokens in action a.
+We discard candidates whose Jaccard similarity
+to an already retained action is at least 0.8. This
+prevents the teacher from spending labels on near-
+identical actions.
+Step 3: Replay Actions for Environment Feed-
+back.We replay each retained candidate from its
+agent state and record the resulting environment
+observation. We remove candidates with duplicate
+non-empty environment observations.
+Step 4: Teacher Labeling.We label candidate
+steps with GPT-5.6. The teacher receives the cur-
+rent trajectory prefix, candidate actions, and their
+immediate observations. The teacher then gen-
+erates structured supervision comprising each ac-
+tion’s expected execution outcome, anticipated con-
+tribution to task progress, a shared rubric for evalu-
+ating the candidate group, and a final score for each
+candidate. This supervision teaches the verifier to
+assess not only which action is preferable but also
+why it is expected to improve the agent state. The
+teacher prompt is provided in Appendix D.3, and
+Appendix E gives a concrete example of teacher
+output and analyzes alternative teacher prompts.
+3.3 Training
+We fine-tune Qwen3.5-4B as the student verifier
+with a 65,536-token context window on 30k action
+labels from 6,000 agent steps. The model learns
+4
+
+Policy Strategy Verifier Setting Resolve (%)↑Total Cost (×)↓Steps (Verified %)
+MiniMax-M2.7
+None No verification 75.47 ±1.40 1.00 46.38(0.00%)
+Trajectory LLM-as-a-Verifier@3 75.85 ±0.87 3.50 –
+Oracle@3 82.20 3.00 –
+All-step Self-Verification 75.27 ±1.86 3.3538.51(100.00%)
+Qwen3.5-4B 76.40 ±0.69 2.26 39.98 (100.00%)
+Selective
+Untrained 76.93 ±1.21 1.20 44.05(12.61%)
+Score Only 76.93 ±0.95 1.0546.93(0.45%)
+Joint Rubric 76.87 ±0.81 1.14 47.28(3.40%)
+Two-Stage Rubric77.20 ±0.87 1.09 46.36(3.43%)
+DeepSeek-V4-Flash
+(Preview)
+None No verification 72.60 ±0.53 1.00 41.64(0.00%)
+Trajectory LLM-as-a-Verifier@374.30 ±0.58 4.19 –
+Oracle@3 80.60 3.00 –
+All-step Self-Verification 72.67 ±0.90 3.9933.56(100.00%)
+Qwen3.5-4B 72.53 ±0.70 2.03 37.14 (100.00%)
+Selective
+Untrained 73.60 ±0.35 1.17 41.36(8.01%)
+Score Only 73.20 ±0.35 1.11 41.56(3.94%)
+Joint Rubric 73.93 ±1.03 1.0841.05(3.54%)
+Two-Stage Rubric 74.27 ±1.01 1.13 42.15(3.59%)
+Table 1: Verification strategies on the full 500-task SWE-Bench Verified set. DeepSeek-V4-Flash uses correct-high reasoning.
+Untrained uses the base Qwen3.5-4B model. Steps are mean executed actions, with verification rates in parentheses. Costs are
+normalized to each policy’s no-verifier baseline; e.g., 1.09× means 9% more cost than no verification. Among non-baseline,
+non-oracle settings, bold/underline mark the best/second-best resolution, steps, and costs within each policy. Across both policies,
+selective verification improves resolution with substantially lower cost than trajectory-level or all-step verification.
+to generate expected execution outcomes, progress
+assessments, rubric-based evaluations, and final
+scores for the candidate actions. We train three
+variants to understand the effects of different train-
+ing and rubric-generation strategies.Score Only
+uses execution-aware preference training data with-
+out rubric generation;Joint Rubricgenerates the
+rubric and score in one call; andTwo-Stage Rubric
+first generates an action-conditioned rubric, then
+scores the action in a separate call. The two-stage
+inference prompts are provided in Appendix D.4.
+4 Experimental Setup
+4.1 Task and Metrics
+We evaluate the main verification strategies
+on the full 500-task SWE-Bench Verified set
+with the mini-swe-agent framework (Yang et al.,
+2024), using MiniMax-M2.7 (MiniMax, 2026) and
+DeepSeek-V4-Flash (DeepSeek-AI, 2026) as pol-
+icy models. The gate/selector and threshold analy-
+ses use a 202-task subset. We report task-resolution
+rate, average trajectory steps, verify rate, and cost
+normalized to the corresponding no-verifier pol-
+icy baseline. For cost accounting, we assume zero
+inference cost for the local lightweight verifier.
+4.2 Verification Settings
+Baselines.No verificationexecutes the initially
+sampled policy action and defines the 1.00 ×
+cost reference.Trajectory verificationsamples
+three complete rollouts: For LLM-as-a-Verifier@3
+(Kwok et al., 2026), the policy model also serves as
+the verifier that selects among three sampled roll-
+outs; Oracle@3 gives an upper bound by selecting a
+successful rollout whenever one exists.All-step ver-
+ificationgenerates three candidate actions at every
+step and selects with either the policy model (Self-
+Verification) or Qwen3.5-4B (Qwen Team, 2026).
+Selective verification.SWE-VERIFIERscores
+the policy’s initial action and triggers additional
+candidate sampling when its score falls below a
+threshold, then ranks the candidates and selects
+the highest-scoring valid action. We evaluate four
+variants:Untrained,Score Only,Joint Rubric,
+andTwo-Stage Rubric. We use a 202-task subset
+with higher outcome variability to identify a cost-
+effective threshold for each verifier on MiniMax-
+M2.7. We then apply a common threshold of 0.2
+to all DeepSeek-V4-Flash experiments, without
+separately tuning it for individual verifier variants.
+Verifier prompts and additional implementation
+details are provided in Appendix D.
+5 Main Results
+Table 1 compares verification strategies across two
+policy models. All SWE-VERIFIERvariants per-
+form both verification triggering and candidate
+ranking. We focus on resolution and total cost,
+5
+
+Gate Selector Resolve (%)↑Steps (Verified %) Policy Cost (×) Total Cost (×)
+No verification – 68.48 ±3.48 57.89(0.00%)1.00 1.00
+Thresholdτ= 0.2
+SWE-VERIFIER(Untrained) MiniMax-M2.7 71.12 ±3.48 55.50(5.41%)1.051.18
+SWE-VERIFIER(Untrained) 70.63 ±0.57 59.43(5.54%)1.161.16
+SWE-VERIFIER(Score Only) MiniMax-M2.773.27 ±2.62 59.21 (5.13%)1.14 1.29
+SWE-VERIFIER(Score Only) 71.95 ±3.78 61.45(5.79%)1.24 1.24
+Thresholdτ= 0.3
+SWE-VERIFIER(Untrained) MiniMax-M2.7 70.13 ±1.03 55.49(13.71%)1.20 1.45
+SWE-VERIFIER(Untrained) 71.95 ±3.02 53.58(13.33%)1.11 1.11
+SWE-VERIFIER(Score Only) MiniMax-M2.772.61 ±2.00 54.16 (10.47%)1.081.29
+SWE-VERIFIER(Score Only) 71.95 ±2.00 58.79(11.74%)1.30 1.30
+Table 2: Gate/selector ablation for MiniMax-M2.7 on 202 tasks, comparing Untrained and Score Only gates paired with either
+MiniMax-M2.7 or the corresponding lightweight verifier as selector at two thresholds. The trained Score Only gate attains the
+highest resolution at both thresholds when paired with MiniMax-M2.7, indicating that a lightweight learned gate can reserve a
+stronger selector for the decisions where it is most useful.
+then examine how training and verification fre-
+quency affect this tradeoff.
+Selective verification improves resolution with
+little overhead over the no-verifier baseline.
+On MiniMax-M2.7, the Two-Stage Rubric SWE-
+VERIFIERdefined in Section 3.3 increases resolu-
+tion from 75.47% to 77.20%, a gain of 1.73 per-
+centage points, at just 1.09× total cost. It outper-
+forms trajectory-level LLM-as-a-Verifier@3, all-
+step Self-Verification, and all-step Qwen3.5-4B
+while verifying only 3.43% of steps. Selective ver-
+ification achieves higher resolution at lower cost
+than the other verification baselines we evaluate,
+but whether its improvement over no verification is
+worthwhile depends on the deployment budget.
+Training improves the accuracy–cost tradeoff.
+Even the Untrained variant improves MiniMax-
+M2.7 resolution to 76.93%. Score Only matches
+this resolution at 1.05× cost while verifying only
+0.45% of steps, making it the lowest-cost SWE-
+VERIFIERvariant on this policy. Joint Rubric
+reaches 76.87%, while Two-Stage Rubric achieves
+the highest resolution, 77.20%, at 1.09× cost. Com-
+pared with the Untrained variant, the trained vari-
+ants use verification much less often while main-
+taining similar or better resolution, indicating that
+training helps concentrate verification on conse-
+quential decisions. Among the trained variants, the
+stronger result from Two-Stage Rubric suggests
+that generating the rubric before scoring can fur-
+ther improve action selection.
+SWE-VERIFIERgeneralizes across policy-
+model families.All four SWE-VERIFIERvari-
+ants improve over the 72.60% no-verifier base-
+line on DeepSeek-V4-Flash. Two-Stage Rubric
+performs best among the selective variants, reach-
+ing 74.27% resolution at 1.13 × cost, while Joint
+Rubric reaches 73.93% at 1.08× cost. Two-Stage
+Rubric nearly matches trajectory-level LLM-as-
+a-Verifier@3, which reaches 74.30% at approxi-
+mately 4.19× cost, whereas all-step Qwen3.5-4B
+provides no improvement at 2.03 × cost. These
+results show that a verifier trained with MiniMax
+actions can selectively improve a policy from a
+different model family without the cost of uni-
+form verification.
+All-step verification shortens trajectories but
+increases total cost.Executed steps alone under-
+state inference cost because verification may gen-
+erate and score multiple candidate actions at each
+step. All-step Self-Verification yields the fewest ex-
+ecuted actions on both policies, reducing MiniMax-
+M2.7 trajectories from 46.38 to 38.51 steps and
+DeepSeek-V4-Flash trajectories from 41.64 to
+33.56 steps. Yet it slightly lowers MiniMax res-
+olution and improves DeepSeek by only 0.07 per-
+centage points, while total costs rise to 3.35× and
+3.99×, respectively. In contrast, Two-Stage Rubric
+SWE-VERIFIERkeeps trajectory lengths close to
+the no-verifier baselines while improving resolu-
+tion at much lower cost. Its advantage therefore
+comes primarily from avoiding unnecessary candi-
+date generation and verification, rather than from
+shortening trajectories alone. This distinction mo-
+tivates the workflow analysis in Section 6.4, where
+we examine whether verification preserves or dis-
+rupts the policy’s problem-solving process.
+6 Additional Analyses
+6.1 Gate/Selector Ablation
+Table 2 compares trained and untrained gates with
+MiniMax-M2.7 as a fixed selector; Appendix C pro-
+6
+
+2 3 4 5 6
+output/input price ratio r
+2.0
+2.5
+3.0
+3.5
+4.0normalized cost
+(a) Price and cache
+0 0.25 0.5 0.75 1
+efficiency gain z
+0
+1
+2
+3
+4normalized cost
+(b) Symbolic efficiency
+0 25 50 75 100
+verification rate (%)
+67
+69
+71
+73resolution (%)
+(a) Resolution
+0 25 50 75 100
+verification rate (%)
+1.0
+1.5
+2.0
+2.5normalized cost
+(b) Cost
+α=5%
+α=20%
+α=8%
+α=100%
+α=10% c=1
+c=0.15
+c=0.5
+c=0.05
+MiniMax-M2.7
+baseline
+Qwen3.5-4B
+trajectory verifier
+SWE-Verifier (Score-only)
+SWE-Verifier (Untrained)
+No-verifier baseline
+Figure 3: MiniMax-M2.7 threshold sensitivity on 202 tasks
+at thresholds {0.1,0.2,0.3,0.5,1} , where threshold 1 denotes
+all-step verification: (a) resolution and (b) normalized API
+cost versus verification rate. Curves show SWE-VERIFIER
+(Untrained) and SWE-VERIFIER(Score-only); the dashed line
+marks no-verifier resolution. Both variants achieve their highest
+resolution below the all-step setting, while higher verification
+rates increase cost without consistently improving resolution.
+2 3 4 5 6
+output/input price ratio r
+2.0
+2.5
+3.0
+3.5
+4.0normalized cost
+(a) Price and cache
+0 0.25 0.5 0.75 1
+efficiency gain z
+0
+1
+2
+3normalized cost
+(b) Symbolic efficiency
+0 25 50 75 100
+verification rate (%)
+67
+69
+71
+73resolution (%)
+(a) Resolution
+0 25 50 75 100
+verification rate (%)
+1.0
+1.5
+2.0
+2.5normalized cost
+(b) Cost
+α=5%
+α=20%
+α=8%
+α=100%
+α=10% c=1
+c=0.15
+c=0.5
+c=0.05
+MiniMax-M2.7
+baseline
+Qwen3.5-4B
+trajectory verifier
+SWE-Verifier (Score-only)
+SWE-Verifier (Untrained)
+No-verifier baseline
+Figure 4: MiniMax-M2.7 cost sensitivity and efficiency plots.
+(a) Measured cost for all-step verification versus output/in-
+put price ratio r and cache multiplier α. (b) Formula cost
+versus fractional trajectory-length reduction z with aggregate
+input/output cost ratio ρ= 4 , cache multiplier α= 0.2 , and
+critical-step rate c∈ {1,0.50,0.15,0.05} . All-step verifica-
+tion remains well above baseline cost; selective verification
+approaches it only with sparse calls and shorter trajectories.
+vides setup details. At τ= 0.2 , the trained Score
+Only gate reaches 73.27% resolution, compared
+with 71.12% for the Untrained gate. The trained
+gate also verifies slightly fewer steps, 5.13% ver-
+sus 5.41%, suggesting that training helps the gate
+select more useful decision points for verification.
+Combining the trained SWE-VERIFIERgate
+with the policy model as selector also improves res-
+olution over using SWE-VERIFIERfor both roles:
+73.27% versus 71.95% at τ= 0.2 , and 72.61%
+versus 71.95% at τ= 0.3 . MiniMax-M2.7 is a
+stronger but much larger selector, so each invoca-
+tion adds substantial verifier cost. However, its
+selections produce shorter trajectories and reduce
+policy-generation cost, partly offsetting this over-
+head. At τ= 0.3 , policy cost falls from 1.30× with
+the lightweight selector to 1.08 × with MiniMax,
+leaving their total costs nearly identical at 1.30 ×
+and 1.29×. This suggests a promising direction:
+use a lightweight trained model to identify critical
+steps and invoke a stronger selector only when its
+expected benefit justifies the additional cost.
+6.2 Threshold Sensitivity
+To examine how verification frequency affects reso-
+lution and cost, we vary the trigger threshold from
+selective verification to all-step verification. Fig-
+ure 3 shows that verifying more steps does not con-
+sistently improve resolution. Score Only performs
+best at its most selective operating point, reaching
+72.28% resolution at 1.02 × cost while verifying
+only 0.47% of steps. As its threshold increases and
+verification becomes more frequent, resolution de-
+clines, eventually reaching 67.16% under all-step
+verification. The Untrained verifier is less sensi-
+tive to this shift, but its best selective setting still
+outperforms its all-step result.
+The larger gap between selective and all-step ver-
+ification for Score Only suggests that training pri-
+marily improves the gate’s ability to identify when
+additional sampling is useful; it does not make ev-
+ery candidate-ranking decision better. A possible
+explanation is a mismatch between training and
+inference candidates. Training groups contain di-
+verse actions sampled from both weak and strong
+models and exclude near duplicates, whereas in-
+ference candidates come from the same policy and
+may differ only subtly. This mismatch may limit
+the trained verifier’s ability to distinguish candi-
+dates when it is applied at every step.
+6.3 Cost Sensitivity
+Pricing and serving effects.Figure 4(a) shows
+that all-step verification remains more expensive
+than the no-verifier baseline across pricing set-
+tings. Self-verification costs 3.0–3.9× the base-
+line because it incurs both candidate-generation
+and verifier-input costs; stronger cache discounts
+increase its normalized cost because the baseline
+benefits more. All-step verification with Qwen3.5-
+4B costs 2.1–2.3× and benefits more from caching
+because the local verifier adds no API input cost.
+Both become more expensive as output prices rise
+relative to input prices because candidate genera-
+tion accounts for more of the total cost.
+Break-even condition.Figure 4(b) shows the
+trajectory reduction needed to match baseline cost
+7
+
+with ρ=x/y= 4 , α= 0.2 , and β= 2 . As c rises
+from 0.05 to 1, the required reduction rises from
+9% to 66% for self-verification and from 3% to
+42% without API verifier cost. At c= 0.15 , these
+values are 22% and 10%, compared with the largest
+observed reductions of 17% for MiniMax-M2.7
+and 19% for DeepSeek-V4-Flash (Table 1). Thus,
+selective verification approaches baseline cost only
+with sparse calls or sufficient trajectory shortening.
+6.4 Workflow Changes
+All-step verification may provide limited gains
+when it changes how the policy approaches the task.
+We examine this failure mode through verifier-as-
+tool, a setting in which the policy knows that a ver-
+ifier will select among its proposed actions and is
+explicitly prompted to generate diverse alternatives.
+Figure 5 shows that ordinary step-level verification
+largely preserves the baseline phase structure, with
+phase agreement above 93% throughout the trajec-
+tory. Verifier-as-tool diverges most during the early
+transition from exploration to fixing, and its reso-
+lution falls below the baseline despite producing
+shorter trajectories. This suggests that verification
+is harmful when the requirement to generate al-
+ternatives interferes with the policy’s exploration
+and repair process. Effective verification should
+improve selected decisions while preserving the
+policy’s broader workflow. Appendix A reports the
+full MiniMax-M2.7 comparison, while Appendix F
+analyzes a post-validation final-patch failure.
+7 Related Work
+Coding Agents.SWE-bench evaluates
+repository-level issue resolution (Jimenez
+et al., 2024), motivating coding agents built around
+interactive tool use, structured repair pipelines,
+and trajectory search (Yang et al., 2024; Wang
+et al., 2025c; Zhang et al., 2024; Xia et al., 2025;
+Antoniades et al., 2025). We study verification of
+these agents’ intermediate decisions about what
+to inspect, execute, edit, and submit.
+Test-time Scaling.Verifiers support test-time
+scaling by scoring sampled solutions or interme-
+diate steps, including through process supervision
+and generative reward modeling (Lightman et al.,
+2024; Chen et al., 2025b; Khalifa et al., 2026).
+For interactive agents, these scores can assess
+progress toward task completion (Xi et al., 2025;
+Chae et al., 2025; Zhang et al., 2025; Choudhury,
+2025). For coding agents, SWE-Gym and R2E-
+Gym train agents and verifiers in executable en-
+vironments (Pan et al., 2025; Jain et al., 2025);
+SWE-TRACE and Guided Search guide search us-
+ing rubric-conditioned process rewards or learned
+action values (Han et al., 2026; Zainullina et al.,
+2025). Other work studies trajectory reranking,
+course correction, action-level process rewards,
+and execution-free evaluation (Wang et al., 2026;
+Gandhi et al., 2025; Dihan and Khan, 2026; Shum
+et al., 2025). SWE-VERIFIERcombines a trained
+generative action verifier with selective invocation,
+using action scores both to identify steps that war-
+rant additional verification and to rank candidate
+actions before execution.
+Inference Efficiency and Selective Verification.
+Repeated sampling increases inference cost (Brown
+et al., 2024), motivating model cascades, cost-
+aware routing, and adaptive compute allocation
+(Chen et al., 2023; Ong et al., 2024; Manvi et al.,
+2024; Chen et al., 2025a; Liu and He, 2026; Alom-
+rani et al., 2025). Coding agents similarly use
+budget-aware tool use and efficient scaffolds to
+control long-horizon execution costs (Wang et al.,
+2025a; Gao and Peng, 2025; Liu et al., 2025; Lin
+et al., 2026). Selective verification reduces over-
+head by avoiding additional candidate generation
+and scoring at every step, saving policy and veri-
+fier computation as well as repeated processing of
+long trajectory histories. Distilling teacher super-
+vision into a smaller verifier further lowers eval-
+uation cost (Hsieh et al., 2023). Together, selec-
+tive invocation and lightweight scoring target com-
+plementary sources of verification overhead: the
+frequency of candidate comparison and the cost
+of each evaluation.
+8 Conclusion
+We introduced SWE-VERIFIER, a lightweight ver-
+ifier that selectively samples and ranks alterna-
+tive coding-agent actions. Trained with execution-
+aware teacher supervision, it improves MiniMax-
+M2.7 resolution from 75.47% to 77.20% while
+verifying 3.43% of steps at 1.09 × total cost. It
+generalizes to DeepSeek-V4-Flash, improving res-
+olution from 72.60% to 74.27% at 1.13× cost. Our
+analyses show that verification works best selec-
+tively: a gate targets decisions that benefit from
+verification, whereas uniform verification adds sub-
+stantial cost without consistent gains. Selective
+verification thus improves coding agents while con-
+trolling inference overhead.
+8
+
+Limitations
+Our experiments use the mini-swe-agent harness to
+evaluate MiniMax-M2.7 and DeepSeek-V4-Flash
+on SWE-Bench-Verified. The observed accuracy–
+cost tradeoffs may differ for other coding bench-
+marks, repository distributions, serving systems,
+or agent frameworks, especially when trajectories
+have different lengths or when candidate actions
+are not generated from a shared prompt.
+Our cost analysis also depends on practical
+serving assumptions. Step-level verification is
+most favorable when repeated candidate prompts
+receive cache discounts and verifier calls are
+inexpensive relative to policy calls. Providers with
+different cache discounts or batching behavior
+may change the break-even point. Finally,
+SWE-VERIFIERis trained from teacher-labeled
+action preferences and successful trajectory states,
+so its judgments may inherit teacher biases and
+may be less reliable on failure modes or domains
+underrepresented in the training data.
+References
+Mohammad Ali Alomrani, Yingxue Zhang, Derek Li,
+Qianyi Sun, Soumyasundar Pal, Zhanguang Zhang,
+Yaochen Hu, Rohan Deepak Ajwani, Antonios Valka-
+nas, Raika Karimi, and 1 others. 2025. Reason-
+ing on a budget: A survey of adaptive and con-
+trollable test-time compute in llms.arXiv preprint
+arXiv:2507.02076.
+Antonis Antoniades, Albert Örwall, Kexun Zhang, Yuxi
+Xie, Anirudh Goyal, and William Yang Wang. 2025.
+SWE-Search: Enhancing software agents with monte
+carlo tree search and iterative refinement. InInterna-
+tional Conference on Learning Representations.
+Longju Bai, Zhemin Huang, Xingyao Wang, Jiao Sun,
+Rada Mihalcea, Erik Brynjolfsson, Alex Pentland,
+and Jiaxin Pei. 2026. How do ai agents spend your
+money? analyzing and predicting token consumption
+in agentic coding tasks.Preprint, arXiv:2604.22750.
+Bradley Brown, Jordan Juravsky, Ryan Ehrlich, Ronald
+Clark, Quoc V . Le, Christopher Ré, and Azalia Mirho-
+seini. 2024. Large language monkeys: Scaling in-
+ference compute with repeated sampling.Preprint,
+arXiv:2407.21787.
+Hyungjoo Chae, Sunghwan Kim, Junhee Cho, Se-
+ungone Kim, Seungjun Moon, Gyeom Hwangbo,
+Dongha Lim, Minjin Kim, Yeonjun Hwang, Minju
+Gwak, Dongwook Choi, Minseok Kang, Gwanhoon
+Im, ByeongUng Cho, Hyojun Kim, Jun Hee Han,
+Taeyoon Kwon, Minju Kim, Beong-woo Kwak, and
+2 others. 2025. Web-shepherd: Advancing PRMs for
+reinforcing web agents.Preprint, arXiv:2505.15277.
+Hao Mark Chen, Guanxi Lu, Yasuyuki Okoshi, Zhi-
+wen Mo, Masato Motomura, and Hongxiang Fan.
+2025a. Rethinking optimal verification granularity
+for compute-efficient test-time scaling. InAdvances
+in Neural Information Processing Systems.
+Lingjiao Chen, Matei Zaharia, and James Zou. 2023.
+FrugalGPT: How to use large language models while
+reducing cost and improving performance.Transac-
+tions on Machine Learning Research.
+Xiusi Chen, Gaotang Li, Ziqi Wang, Bowen Jin, Cheng
+Qian, Yu Wang, Hongru Wang, Yu Zhang, Denghui
+Zhang, Tong Zhang, Hanghang Tong, and Heng Ji.
+2025b. RM-R1: Reward modeling as reasoning.
+Preprint, arXiv:2505.02387.
+Sanjiban Choudhury. 2025. Process reward models
+for LLM agents: Practical framework and directions.
+Preprint, arXiv:2502.10325.
+DeepSeek-AI. 2026. DeepSeek-V4: Towards highly
+efficient million-token context intelligence. Official
+model card.
+Mahir Labib Dihan and Md Ashrafur Rahman Khan.
+2026. SWE-Shepherd: Advancing PRMs for rein-
+forcing code agents.Preprint, arXiv:2604.10493.
+Zhiyu Fan, Kirill Vasilevski, Dayi Lin, Boyuan Chen,
+Yihao Chen, Zhiqing Zhong, Jie M Zhang, Pinjia He,
+and Ahmed E Hassan. 2025. Swe-effi: Re-evaluating
+software ai agent system effectiveness under resource
+constraints.arXiv preprint arXiv:2509.09853.
+Shubham Gandhi, Jason Tsay, Jatin Ganhotra, Kiran
+Kate, and Yara Rizk. 2025. When agents go astray:
+Course-correcting SWE agents with PRMs.Preprint,
+arXiv:2509.02360.
+Pengfei Gao and Chao Peng. 2025. More with less: An
+empirical study of turn-control strategies for efficient
+coding agents.arXiv preprint arXiv:2510.16786.
+Hao Han, Jin Xie, Xuehao Ma, Weiquan Zhu, Ziyao
+Zhang, ZhiLiang Long, Hongkai Chen, and Qing-
+wen Ye. 2026. SWE-TRACE: Optimizing long-
+horizon SWE agents through rubric process reward
+models and heuristic test-time scaling.Preprint,
+arXiv:2604.14820.
+Cheng-Yu Hsieh, Chun-Liang Li, Chih-kuan Yeh,
+Hootan Nakhost, Yasuhisa Fujii, Alex Ratner, Ranjay
+Krishna, Chen-Yu Lee, and Tomas Pfister. 2023. Dis-
+tilling step-by-step! outperforming larger language
+models with less training data and smaller model
+sizes. InFindings of the Association for Compu-
+tational Linguistics: ACL 2023, pages 8003–8017,
+Toronto, Canada. Association for Computational Lin-
+guistics.
+Naman Jain, Jaskirat Singh, Manish Shetty, Liang
+Zheng, Koushik Sen, and Ion Stoica. 2025. R2E-
+Gym: Procedural environments and hybrid verifiers
+for scaling open-weights SWE agents.Preprint,
+arXiv:2504.07164.
+9
+
+Carlos E. Jimenez, John Yang, Alexander Wettig,
+Shunyu Yao, Kexin Pei, Ofir Press, and Karthik
+Narasimhan. 2024. SWE-bench: Can language mod-
+els resolve real-world GitHub issues? InInterna-
+tional Conference on Learning Representations.
+Muhammad Khalifa, Rishabh Agarwal, Lajanugen Lo-
+geswaran, Jaekyeom Kim, Hao Peng, Moontae Lee,
+Honglak Lee, and Lu Wang. 2026. Process reward
+models that think.Transactions on Machine Learn-
+ing Research.
+Jacky Kwok, Shulu Li, Pranav Atreya, Yuejiang Liu,
+Marco Pavone, Ion Stoica, and Azalia Mirhoseini.
+2026. LLM-as-a-Verifier: A general-purpose verifi-
+cation framework. Notion blog.
+Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri
+Edwards, Bowen Baker, Teddy Lee, Jan Leike, John
+Schulman, Ilya Sutskever, and Karl Cobbe. 2024.
+Let’s verify step by step. InInternational Conference
+on Learning Representations.
+Fulin Lin, Shaowen Chen, Ruishan Fang, Hongwei
+Wang, and Tao Lin. 2026. Stop wasting your tokens:
+Towards efficient runtime multi-agent systems. In
+The Fourteenth International Conference on Learn-
+ing Representations.
+Siran Liu and Cyril Y . He. 2026. ConfSpec: Efficient
+step-level speculative reasoning via confidence-gated
+verification.Preprint, arXiv:2602.18447.
+Tengxiao Liu, Zifeng Wang, Jin Miao, I Hsu, Jun
+Yan, Jiefeng Chen, Rujun Han, Fangyuan Xu, Yan-
+fei Chen, Ke Jiang, and 1 others. 2025. Budget-
+aware tool-use enables effective agent scaling.arXiv
+preprint arXiv:2511.17006.
+Rohin Manvi, Anikait Singh, and Stefano Ermon. 2024.
+Adaptive inference-time compute: LLMs can predict
+if they can do better, even mid-generation.Preprint,
+arXiv:2410.02725.
+MiniMax. 2026. MiniMax M2.7: Early echoes of self-
+evolution. Official release page.
+Isaac Ong, Amjad Almahairi, Vincent Wu, Wei-Lin Chi-
+ang, Tianhao Wu, Joseph E. Gonzalez, M. Waleed
+Kadous, and Ion Stoica. 2024. RouteLLM: Learn-
+ing to route LLMs with preference data.Preprint,
+arXiv:2406.18665.
+Jiayi Pan, Xingyao Wang, Graham Neubig, Navdeep
+Jaitly, Heng Ji, Alane Suhr, and Yizhe Zhang. 2025.
+Training software engineering agents and verifiers
+with SWE-Gym. InInternational Conference on
+Machine Learning.
+Qwen Team. 2026. Qwen3.5: Towards native multi-
+modal agents. Official release page.
+Mohamad Salim, Jasmine Latendresse, SayedHassan
+Khatoonabadi, and Emad Shihab. 2026. Tokenomics:
+Quantifying where tokens are used in agentic soft-
+ware engineering.arXiv preprint arXiv:2601.14470.
+KaShun Shum, Binyuan Hui, Jiawei Chen, Lei Zhang,
+X. W., Jiaxi Yang, Yuzhen Huang, Junyang Lin,
+and Junxian He. 2025. SWE-RM: Execution-free
+feedback for software engineering agents.Preprint,
+arXiv:2512.21919.
+Charlie Victor Snell, Jaehoon Lee, Kelvin Xu, and Avi-
+ral Kumar. 2025. Scaling LLM test-time compute
+optimally can be more effective than scaling param-
+eters for reasoning. InThe Thirteenth International
+Conference on Learning Representations.
+Ningning Wang, Xavier Hu, Pai Liu, He Zhu, Yue Hou,
+Heyuan Huang, Shengyu Zhang, Jian Yang, Jiaheng
+Liu, Ge Zhang, and 1 others. 2025a. Efficient agents:
+Building effective agents while reducing cost.arXiv
+preprint arXiv:2508.02694.
+Qian Wang, Zhenheng Tang, ZICHEN JIANG, Nuo
+Chen, Tianyu Wang, and Bingsheng He. 2025b.
+Agenttaxo: Dissecting and benchmarking token dis-
+tribution of LLM multi-agent systems. InICLR 2025
+Workshop on Foundation Models in the Wild.
+Xingyao Wang, Valerie Chen, Heng Ji, and Gra-
+ham Neubig. 2026. A rubric-supervised critic
+from sparse real-world outcomes.arXiv preprint
+arXiv:2603.03800.
+Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu,
+Xiangru Tang, Mingchen Zhuge, Jiayi Pan, Yueqi
+Song, Bowen Li, Jaskirat Singh, Hoang H. Tran,
+Fuqiang Li, Ren Ma, Mingzhang Zheng, Bill Qian,
+Yanjun Shao, Niklas Muennighoff, Yizhe Zhang,
+Binyuan Hui, and 5 others. 2025c. OpenHands: An
+open platform for ai software developers as general-
+ist agents. InInternational Conference on Learning
+Representations.
+Zhiheng Xi, Chenyang Liao, Guanyu Li, Yajie Yang,
+Wenxiang Chen, Zhihao Zhang, Binghai Wang, Sen-
+jie Jin, Yuhao Zhou, Jian Guan, Wei Wu, Tao Ji,
+Tao Gui, Qi Zhang, and Xuanjing Huang. 2025.
+AgentPRM: Process reward models for LLM agents
+via step-wise promise and progress.Preprint,
+arXiv:2511.08325.
+Chunqiu Steven Xia, Yinlin Deng, Soren Dunn, and
+Lingming Zhang. 2025. Agentless: Demystifying
+LLM-based software engineering agents. InProceed-
+ings of the ACM on Software Engineering.
+John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian
+Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir
+Press. 2024. SWE-agent: Agent-computer interfaces
+enable automated software engineering. InAdvances
+in Neural Information Processing Systems.
+Karina Zainullina, Alexander Golubev, Maria Trofi-
+mova, Sergei Polezhaev, Ibragim Badertdinov, Daria
+Litvintseva, Simon Karasik, Filipp Fisin, Sergei
+Skvortsov, Maksim Nekrashevich, Anton Shevtsov,
+and Boris Yangel. 2025. Guided search strategies in
+non-serializable environments with applications to
+software engineering agents. InProceedings of the
+42nd International Conference on Machine Learning.
+10
+
+Danyang Zhang, Situo Zhang, Ziyue Yang, Zichen Zhu,
+Zihan Zhao, Ruisheng Cao, Lu Chen, and Kai Yu.
+2025. ProgRM: Build better gui agents with progress
+rewards.Preprint, arXiv:2505.18121.
+Yuntong Zhang, Haifeng Ruan, Zhiyu Fan, and Abhik
+Roychoudhury. 2024. AutoCodeRover: Autonomous
+program improvement. InProceedings of the 33rd
+ACM SIGSOFT International Symposium on Soft-
+ware Testing and Analysis.
+11
+
+Resolve∆Resolve Steps Verify Rate Policy Cost Total Cost
+MiniMax-M2.7 baseline 75.5% +0.0 46.4 0% 1.00×1.00×
+Trajectory-level upper bound
+Oracle@3 82.2% +6.7 139.1 – 3.00×3.00×
+Step-level verifier
+All Steps
+verifier (n= 3) 76.2% +0.7 38.2 100% 1.15×2.16×
+verifier (n= 5) 76.0% +0.5 35.9 100% 1.38×2.32×
+verifier prefix (n= 3) 75.6% +0.1 35.7 89% 1.00×1.77×
+Verifier-as-Tool
+verifier-as-tool (n= 3) 70.2% -5.3 30.4 99% 0.71×1.40×
+verifier-as-tool (n= 5) 69.2% -6.3 37.1 99% 0.99×1.97×
+Selective Steps(n= 5)
+every 5 steps 75.0% -0.5 44.2 21% 1.08×1.39×
+explore phase 76.0% +0.5 39.3 41% 1.28×1.68×
+validate phase 76.4% +0.9 43.3 33% 1.47×1.97×
+fix phase 76.2% +0.7 45.3 9% 1.16×1.35×
+closeout phase 76.6% +1.1 47.7 4% 1.16×1.29×
+Small-model verifier
+Qwen3.5-4B (n= 3) 76.0% +0.5 40.8 89% 1.28×1.28×
+Table 3: MiniMax-M2.7 results on the full 500-task SWE-Bench Verified set. Each step-level and small-model verification
+setting reports a single run on all 500 tasks. The no-verifier baseline averages three runs, and Oracle@3 selects a successful
+rollout whenever one exists among those three runs. ∆ Resolve is measured against the averaged no-verifier baseline. Verify
+Rate is the fraction of trajectory steps where candidate actions are verified. Policy Cost counts only MiniMax-M2.7 policy
+tokens; Total Cost includes verifier-selection calls but excludes label-gate cost for selective-step rows. Small trained verifier calls
+are treated as near-zero relative to frontier policy calls, so their Total Cost equals Policy Cost.
+A MiniMax-M2.7 Verification Strategies
+We evaluate MiniMax-M2.7 on SWE-Bench-
+Verified across trajectory-level, step-level,
+selective-step, and small-verifier settings. Table 3
+reports the full comparison. We report task
+resolution, trajectory length, verification rate,
+and cost normalized to the three-seed no-verifier
+MiniMax-M2.7 baseline. Verification rate is the
+fraction of steps where the verifier is invoked;
+candidate actions are verified only when at least
+two are unique.
+Verifier settings.The trajectory-level verifier
+samples multiple complete rollouts and uses an
+LLM to select the final trajectory. Step-level veri-
+fiers instead select among candidate actions within
+a rollout:All Stepsvariants verify every state,
+whereasSelective Stepsvariants verify only a sub-
+set based on step frequency or an agent phase clas-
+sified by Qwen3.5-27B.Verifier-as-toolallows the
+policy to call a verifier tool with multiple candi-
+date actions. The small-model setting keeps the
+policy fixed while replacing the action verifier with
+Qwen3.5-4B.
+A.1 Full Verification Improves Step Efficiency
+but Remains Costly
+The baseline solves 75.5% of tasks with 46.4 steps
+on average. Full verification with five candidates
+slightly raises resolution to 76.0% and shortens
+the average trajectory to 35.9 steps, but its total
+cost reaches 2.32× the baseline because candidate
+generation and verifier scoring occur throughout
+the trajectory. With three candidates, full verifi-
+cation reaches 76.2% resolution in 38.2 steps at
+2.16× total cost. These results suggest that step-
+level verification can improve local decisions and
+reduce environment interactions, but the savings
+from shorter trajectories do not offset the cost of
+verifying every step.
+A.2 Verifier Awareness Can Disrupt the
+Workflow
+Verifier-as-tool makes the policy aware that a ver-
+ifier will select among its proposed actions and
+explicitly prompts it to generate diverse alterna-
+tives. This changes more than the selected action:
+it can alter how the policy approaches each deci-
+sion. Figure 5 shows that its phase agreement with
+the baseline drops to 83–86% in the 10–40% region,
+where the baseline transitions from exploration to
+fixing, before recovering above 95% later in the
+trajectory.
+Table 3 shows the corresponding performance
+effect. Ordinary step-level verification improves
+over the baseline, reaching 76.2% resolution with
+three candidates and 76.0% with five. Verifier-as-
+tool produces shorter trajectories, but resolution
+falls to 70.2% and 69.2%, respectively. Shorter
+trajectories therefore help only when they remove
+unnecessary actions; they hurt when generating
+alternatives for the verifier disrupts the exploration
+12
+
+0%
+50%
+100%
+Baseline
+phase share
+Explore Fix Validate Closeout
+0 20 40 60 80 100%
+Normalized trajectory position
+80%
+90%
+100%
+Phase match
+Verifier
+Verifier-as-tool
+Figure 5: Phase composition and cross-setting phase stability
+over normalized trajectory position. Colored areas show the
+baseline phase distribution. Lines show the fraction of steps
+whose phase matches the baseline within each position bin.
+The verifier largely preserves the baseline workflow structure,
+while verifier-as-tool differs most in the early and middle bins
+before converging later.
+and fixing phases required to solve the task.
+A.3 Verification Value Depends on the
+Decision State
+Selective verification provides a stronger cost–
+performance tradeoff when it targets particular
+agent phases. Closeout-phase verification achieves
+the highest resolution, 76.6%, while verifying only
+4% of steps and costing 1.29 × the baseline. Fix-
+phase verification similarly reaches 76.2% resolu-
+tion with a 9% verification rate and 1.35 × total
+cost. In contrast, periodic verification every five
+steps lowers resolution to 75.0% despite verifying
+21% of steps. Sparsity alone is therefore insuffi-
+cient: effective selective verification must identify
+decision states where comparing alternative actions
+is likely to matter.
+A.4 A Small Model Verifier Reduces
+Verification Cost
+Small verifiers make step-level scaling more at-
+tractive because their calls are nearly free relative
+to frontier policy calls. The Qwen3.5-4B verifier
+reaches 76.0% resolution with 1.28× policy cost
+and the same 1.28× total cost under near-zero ver-
+ifier accounting. This matches the accuracy of
+frontier self-verification while avoiding most of
+its verifier overhead. The result motivates SWE-
+VERIFIER: a verifier should retain the judgment
+quality of larger models while keeping the serving
+cost close to that of a small model.
+B Detailed Formulation
+A coding-agent task starts from an initial task con-
+text q (e.g., an issue description, repository state,
+and instructions). The agent then produces an in-
+teractive rollout with alternating actions at (e.g.,
+shell command, file edit, test invocation, or final re-
+sponse) and observations ot (e.g., command output,
+test results, or file contents):
+τ= (q, a 1, o1, . . . , aT , oT ).(7)
+We define ht = (q, a 1, o1, . . . , at−1, ot−1) as
+the interaction history up to step t, R(τ)∈ {0,1}
+as whether the completed rollout resolves the task.
+The task objective is to learn a policy that maxi-
+mizes the expected task success:
+J(θ) =E q∼D, τ∼π θ(·|q)
+
+R(τ)
+
+,(8)
+where D denotes the distribution over task contexts.
+We note that directly optimizing J(θ) is difficult
+as R(τ) is a sparse, trajectory-level signal that de-
+pends on the entire action sequence, yet the policy
+must commit to one action at a time without know-
+ing how the rollout will unfold. To localize this
+difficulty, we decompose the objective along the
+trajectory. Define the state-action value
+Q(ht, at) =E πθ
+
+R(τ)
+
+
+ ht, at
+
+,(9)
+which is the probability that committing to action
+at at history ht leads to eventual task resolution
+under the policy’s continuation. By the tower prop-
+erty, the trajectory-level objective admits a step-
+level form,
+J(θ) =E q∼D Eht∼πθ
+
+Eat∼πθ(·|ht)
+
+Q(ht, at)
+
+,
+(10)
+so the overall success rate is the expected Q-value
+of the actions the policy commits to along the roll-
+out. Improving any single decision directly raises
+the probability of resolution, which is to improve
+the quality of an intermediate action. Let
+Q(ht, at) = E[R(τ)|h t, at](11)
+denote the latent probability that taking action at
+after history ht leads to eventual task resolution af-
+ter the rest of the rollout. The base policy executes
+one action from π(· |h t) without explicitly com-
+paring alternatives. Step-level scaling changes this
+local decision rule: it samples multiple plausible
+next actions for the same history and uses a verifier
+as a proxy forQ.
+13
+
+For a candidate set At, the ideal step-level selec-
+tor would choose
+aoracle
+t = arg max
+a∈At
+Q(ht, a),(12)
+butQis unobserved at inference time. A practical
+verifier v(ht, a) approximates this ordering using
+the task context, prior actions and observations,
+and proposed next action. The expected gain from
+verifying steptis
+∆t = EAt
+
+max
+a∈At
+Q(ht, a)
+
+−E a∼π(·|ht)[Q(ht, a)].
+(13)
+We call a step critical when ∆t is large enough to
+justify additional samples and verifier cost. Let
+gt ∈ {0,1} indicate whether the agent verifies step
+t, ideally selecting critical steps and skipping rou-
+tine ones. The realized critical-step verification rate
+is
+c= 1
+T
+TX
+t=1
+gt.(14)
+Step-level scaling.At a subset of decision points,
+a scaled policy samples a set of candidate actions
+At ={a (1)
+t , . . . , a(n)
+t }, a (i)
+t ∼π(· |h t),
+(15)
+and a verifiervselects the action to execute:
+a⋆
+t = arg max
+a∈At
+v(ht, a).(16)
+Equivalently, the inference-time policy is
+π′(ht) =
+(
+arg maxa∈At v(ht, a), g t = 1,
+at, a t ∼π(· |h t), g t = 0.
+(17)
+Trajectory-level scaling.Trajectory-level scal-
+ing samples n complete trajectories and selects one
+with an outcome verifier:
+τ ⋆ = arg max
+τi∈{τ1,...,τn}
+Vout(τi), τ i ∼π.(18)
+Because selection occurs only after rollout, the
+method incurs the full cost of generating all n tra-
+jectories.
+B.1 Cost Formulation
+To understand the extra cost introduced by verifica-
+tion and candidate sampling, we decompose each
+agent rollout into policy cost and verifier cost. Let
+x and y denote the input-token and output-token
+cost of a baseline agent trajectory, respectively. The
+baseline cost is
+C0 =x+y.(19)
+Trajectory-level scaling.The standard best-of- n
+strategy samples n complete trajectories and then
+applies an outcome verifier:
+Ctraj(n)≈n(x+y) +C outcome verifier.(20)
+Step-level scaling.A step-level verifier samples
+additional actions only at selected steps. Let
+z∈[0,1] denote the fractional reduction in tra-
+jectory length, let c denote the critical-step rate
+(c= 1 corresponds to verifying every step), and
+let α denote the cached-input price as a fraction of
+the standard input price. The first candidate incurs
+input cost x, while each additional candidate at a
+verified step incurs cached-input cost αx. Every
+candidate incurs output cost y. The policy-side cost
+is
+Cpolicy = (1−z){x[1 +αc(n−1)]
++y[1 +c(n−1)]}. (21)
+Section 6.3 studies how this cost changes under
+different pricing and cache settings.
+Verifier overhead.Let β denote the verifier scor-
+ing cost relative to one policy-output trajectory cost.
+The complete step-level cost is
+Cstep =C policy + (1−z)c[x+βy].(22)
+Table 4 in Appendix B summarizes the same ac-
+counting across the verification strategies we study.
+C Gate and Selector Ablation
+Table 2 compares gate-only verification with full se-
+lective verification at τ∈ {0.2,0.3} . Within each
+threshold group, SWE-VERIFIER(Untrained) and
+SWE-VERIFIER(Score Only) act as gates, with
+either MiniMax or the same SWE-VERIFIERvari-
+ant selecting candidates. At τ= 0.2 , the Score
+Only gate with MiniMax selection reaches 73.27%
+resolution at 1.29× cost, versus 71.95% at 1.24×
+when Score Only also selects. At τ= 0.3 , Un-
+trained selection reaches 71.95% at 1.11 × cost,
+versus 70.13% at 1.45× with MiniMax selection.
+The selector therefore affects both resolution and
+cost; these are descriptive comparisons across un-
+paired runs. Both SWE-VERIFIERvariants use
+the teacher-aligned prompt, three scores per ac-
+tion, temperature 1, and top-p= 0.95 . Candidate
+expansion produces three actions. MiniMax selec-
+tion uses basic/verifier. Untrained uses base
+Qwen3.5-4B; Score Only is trained without rubric
+supervision. Policy cost covers action generation,
+14
+
+Verification strategy Policy input cost Policy output cost Verifier input cost Verifier output cost
+Baselinex y0 0
+Trajectory-levelnx ny V in
+traj V out
+traj
+Step-level(1−z)x[1 +αc(n−1)] (1−z)y[1 +c(n−1)] (1−z)cx(1−z)cβy
+Small step-level verifier(1−z)x[1 +αc(n−1)] (1−z)y[1 +c(n−1)]≈0≈0
+Table 4: Cost decomposition for the verification strategies. Here x and y are the baseline policy input and output costs, n is the
+number of trajectories or candidate actions, z is the fractional trajectory-length reduction, c is the realized verification rate with
+c= 1 for every-step verification, α is the cached-input price multiplier, β is the verifier scoring cost ratio, and V in
+traj and V out
+traj
+are the outcome-verifier costs for trajectory-level scaling. The first candidate incurs input cost x; each later candidate incurs
+cached-input costαx.
+including alternatives; total cost also includes Min-
+iMax selection when used. Verification rates pool
+expansion decisions across runs.
+15
+
+D Verifier Prompts
+This appendix records the prompt templates used
+for verifier-based candidate selection, critical-step
+classification, and teacher-label generation. We in-
+clude five verifier configurations. The multi-action
+verifier prompt scores a full candidate slate and se-
+lects one action. The single-action verifier prompt
+uses the same candidate-selection objective but
+emphasizes candidate-local reasoning and scalar
+scoring. The teacher-distillation prompt exposes
+candidate observations or future evidence to the
+teacher and asks it to distill that information into
+trajectory summaries, checklist criteria, next-state
+predictions, checklist scores, and final scalar scores.
+The two-stage verifier uses separate prompts to gen-
+erate an action-conditioned checklist and score the
+proposed action against it. The action-classifier
+prompt assigns each sampled action an action cat-
+egory, problem-solving phase, uncertainty/risk la-
+bels, and a should_run_verifier decision used
+for selective verification.
+For training, we use the fused AdamW optimizer
+with a learning rate of 5×10 −6, cosine learning-
+rate decay, and an effective batch size of 16. Train-
+ing runs for three epochs on four NVIDIA H200
+GPUs using Hugging Face Transformers and Py-
+Torch with BF16 mixed precision.
+D.1 Multi-action verifier prompt
+Multi-action verifier prompt
+[[[SYSTEM_TEMPLATE]]]
+You are an expert verifier-teacher for a coding agent. Your
+job is to compare several candidate next actions and choose
+the single best one to execute next.
+Prioritize actions that are:
+1) Correct and directly advance the task.
+2) Safe: non-destructive, no data loss, and no irreversible
+commands.
+3) Minimal and precise: the smallest change or command that
+advances the goal.
+4) Compliant with the task and conversation instructions.
+5) Likely to succeed given the current repository state and
+constraints.
+For each candidate block, write reasoning that evaluates
+only that candidate on its own merits. The distilled
+student verifier will later see one candidate action at a
+time, so each candidate-local explanation must stand alone.
+If information from other candidates helps calibrate the
+usefulness, risk, or strength of the current candidate,
+incorporate that signal as standalone reasoning about this
+candidate rather than as an explicit comparison.
+Do not compare candidates inside candidate-local reasoning.
+Candidate comparisons are allowed only in the final overall
+reasoning block. Always follow the output format exactly.
+[[[SELECTION_TEMPLATE]]]
+Task: {{ task }}
+{% if history_message_format == "single_prompt" %}
+Recent steps (history_steps={{ history_steps }}, latest
+last):
+{% set visible_steps = all_steps if history_steps == -1
+else steps %}
+{% for step in visible_steps %}
+{% for msg in step %}
+{{ msg.role }}: {{ msg.content }}
+{% endfor %}
+{% endfor %}
+{% else %}
+Use the preceding conversation as the trajectory history.
+{% endif %}
+Candidates:
+{% for c in candidates %}
+Candidate {{ c.index + selection_index_base }}:
+{{ c.content }}
+{% endfor %}
+Choose the single best candidate action.
+Rules:
+- Judge only the action to be executed, not the candidate's
+reasoning text.
+- In each candidate block, explain only the likely outcome,
+risks, and usefulness of that specific candidate.
+- Prefer commands that are safe, minimal, and likely to
+succeed.
+- Avoid destructive operations unless explicitly required.
+- If all candidates are invalid, pick the least harmful
+option.
+- Assign a scalar score to every candidate action.
+- Use this score calibration:
+- 1.0: Ideal next action; clearly correct, safe, minimal,
+and directly advances the task.
+- 0.7-0.9: Strong action; likely helpful but slightly
+indirect or missing a minor prerequisite.
+- 0.6-0.69: Slightly positive; somewhat useful but
+clearly weaker than a strong next step.
+- 0.5: Neutral boundary; redundant, not harmful, but not
+meaningfully useful.
+- 0.4-0.49: Slightly negative; probably not the right
+next step, but mostly harmless.
+- 0.1-0.39: Negative; redundant, risky, based on a
+misunderstanding, or weak expected progress.
+- 0.0: Clearly harmful, irrelevant, or very unlikely to
+succeed.
+Important:
+- The distilled student verifier will only see one
+candidate action at a time.
+- Do not mention other candidates inside a candidate block.
+- If other candidates help calibrate this candidate, fold
+that signal into standalone reasoning.
+Output format:
+{% for c in candidates %}
+- Candidate {{ c.index + selection_index_base }}: {{
+c.action or c.content }}
+REASONING: <2-5 sentences about this candidate only>
+SCORE: <scalar 0.0-1.0>
+{% endfor %}
+REASONING: <2-5 sentences comparing the strongest
+candidates and explaining the final choice>
+FINAL: <number>
+D.2 Single-action verifier prompt
+Single-action verifier prompt
+[[[SYSTEM_TEMPLATE]]]
+You are an expert verifier for a coding agent. Your job is
+to choose the single best candidate action to execute next.
+Prioritize actions that are:
+1) Correct and directly advance the task.
+2) Safe: non-destructive, no data loss, and no irreversible
+commands.
+3) Minimal and precise: the smallest change or command that
+advances the goal.
+4) Compliant with the task and conversation instructions.
+5) Likely to succeed given the current repository state and
+constraints.
+Do not choose actions that are vague or that alter
+unrelated files. If multiple candidates are equivalent,
+prefer the one with lower risk and fewer side effects.
+Always follow the output format exactly.
+16
+
+[[[SELECTION_TEMPLATE]]]
+Task: {{ task }}
+{% if history_message_format == "single_prompt" %}
+Recent steps (history_steps={{ history_steps }}, latest
+last):
+{% set visible_steps = all_steps if history_steps == -1
+else steps %}
+{% for step in visible_steps %}
+{% for msg in step %}
+{{ msg.role }}: {{ msg.content }}
+{% endfor %}
+{% endfor %}
+{% else %}
+Use the preceding conversation as the trajectory history.
+{% endif %}
+Choose the single best candidate action.
+Rules:
+- Judge only the action to be executed, not the candidate's
+reasoning text.
+- Prefer commands that are safe, minimal, and likely to
+succeed.
+- Avoid destructive operations unless explicitly required.
+- If all candidates are invalid, pick the least harmful
+option.
+- For each candidate, predict a concrete next-state
+progression grounded in the context and assign a score.
+- Always include a scalar score for every candidate action.
+Output format:
+{% for c in candidates %}
+- Candidate {{ c.index + selection_index_base }}:
+REASONING: <2-5 sentences>
+SCORE: <scalar 0.0-1.0>
+{% endfor %}
+REASONING: <2-5 sentences>
+FINAL: <number>
+Candidates:
+{% for c in candidates %}
+Candidate {{ c.index + selection_index_base }}:
+{{ c.content }}
+{% endfor %}
+D.3 Teacher-distillation prompt
+Teacher-distillation prompt
+[[[SYSTEM_TEMPLATE]]]
+You are an expert verifier-teacher for a coding agent.
+Given the current trajectory, your job is to compare
+several candidate next actions and choose the single best
+one to execute next.
+Prioritize actions that are:
+1) Correct and directly advance the task.
+2) Safe: non-destructive, no data loss, and no irreversible
+commands.
+3) Minimal and precise: the smallest change or command that
+advances the goal.
+4) Compliant with the task and conversation instructions.
+5) Likely to succeed given the current repository state and
+constraints.
+Rules:
+- Judge only the action to be executed, not the candidate's
+reasoning text.
+- In each candidate block, explain only the likely outcome,
+risks, and usefulness of that specific candidate.
+- All candidate-local output fields must be standalone and
+understandable without reading other candidate blocks, the
+final choice, or prompt-only evidence.
+- Do not mention prompt artifacts or evidence sources such
+as "provided evidence", "candidate future evidence",
+"teacher-only evidence", "above", "hidden reference", or
+"based on the evidence" in any candidate-local field.
+- The generated outputs will later train a distilled
+student verifier model; the student sees only one candidate
+action at a time.
+- If other candidates help calibrate this candidate, fold
+that signal into standalone reasoning rather than explicit
+comparison.
+- Do not mention other candidates or candidate numbers
+inside a candidate block.
+- Do not mention the hidden reference in any output field.
+- Prefer commands that are safe, minimal, and likely to
+succeed.
+- Avoid destructive operations unless explicitly required.
+- If all candidates are invalid, pick the least harmful
+option.
+- Assign a scalar score to every candidate action.
+- Start with the requested output format; do not add hidden
+thoughts or extra preamble.
+- Use this score calibration:
+- 1.0: Ideal next action; clearly correct, safe, minimal,
+and directly advances the task.
+- 0.7-0.9: Strong action; likely helpful but slightly
+indirect or missing a minor prerequisite.
+- 0.6-0.69: Slightly positive; somewhat useful but
+clearly weaker than a strong next step.
+- 0.5: Neutral boundary; redundant, not harmful, but not
+meaningfully useful.
+- 0.4-0.49: Slightly negative; probably not the right
+next step, but mostly harmless.
+- 0.1-0.39: Negative; redundant, risky, based on a
+misunderstanding, or weak expected progress.
+- 0.0: Clearly harmful, irrelevant, or very unlikely to
+succeed.
+Always follow the output format exactly.
+[[[SELECTION_TEMPLATE]]]
+{% if history_message_format == "single_prompt" -%}
+{% if history_steps == -1 %}
+Trajectory so far (latest last):
+{% else %}
+Recent trajectory steps (last {{ history_steps }}, latest
+last):
+{% endif %}
+user: Task: {{ task }}
+{% set visible_steps = all_steps if history_steps == -1
+else steps %}
+{% for step in visible_steps %}
+{% for msg in step %}
+{{ msg.role }}: {{ msg.content }}
+{% endfor %}
+{% endfor %}
+{% endif -%}
+[[[PROMPT_CACHE_BOUNDARY]]]
+Task: {{ task }}
+Candidates and future evidence:
+{% for c in candidates %}
+[{{ c.index + selection_index_base }}]
+Action:
+{{ c.content }}
+Immediate observation:
+{{ c.next_state_observed_text or "No observed immediate
+evidence available." }}
+{% if future_horizon|default(0)|int > 0 %}
+Future continuation:
+{{ c.future_steps_text or c.future_steps_summary_text or
+"No future continuation available." }}
+{% endif %}
+{% endfor %}
+Review the current trajectory, then follow the instructions
+below carefully and select the best action.
+1. Summary
+First output a <summary>...</summary> section that captures
+the current trajectory state before scoring any candidate.
+Summary field definitions:
+- Task_State: concise task goal and current state.
+- Completed_Progress: confirmed useful work already done.
+- Open_Blockers: unresolved issues or evidence gaps
+blocking completion.
+- Constraints: safety, instruction, or repository
+constraints that should guide the next action.
+- Likely_Next_Needs: near-term needs the next action should
+satisfy.
+- Failure_Modes_To_Avoid: likely mistakes, risks, or
+counterproductive paths to avoid.
+2. Checklist
+17
+
+After the summary, output a <checklist>...</checklist>
+section generated from the current trajectory, candidate
+actions, and summary.
+Checklist requirements:
+- Include a brief REASONING line explaining why the
+checklist covers the key decision criteria derived from the
+summary.
+- The checklist should help judge which candidate action is
+most able to make correct, safe, minimal progress from the
+current trajectory toward solving the task.
+- Each checklist item should be an observable criterion for
+the next action, such as confirming the right evidence,
+editing the right file, running the right validation,
+respecting safety constraints, or avoiding likely failure
+modes.
+- Use weights must, should, or nice to reflect importance.
+3. Candidate evaluation
+For each candidate, output NEXT_STATES_PREDICTION, then
+checklist item scores, then candidate REASONING, then
+SCORE.
+NEXT_STATES_PREDICTION field definitions:
+- Candidate future evidence is teacher-only and may include
+execution results for each candidate. The student verifier
+will not see this evidence.
+- Use teacher-only evidence to choose the best candidate,
+then distill useful prediction signal into
+NEXT_STATES_PREDICTION, candidate REASONING, and SCORE.
+- Immediate_Observation: state the direct immediate result
+of executing the candidate action. Write this as an outcome,
+not as a reference to evidence sources.
+{% if future_horizon|default(0)|int > 0 %}
+- Future_Trace: the task-relevant future action/observation
+progression for the candidate, summarized as evidence for
+what the candidate leads to.
+{% endif %}
+- Expected_Progress: how the observed or predicted
+immediate/future evidence changes the task state, including
+whether the candidate advances, stalls, or risks the task.
+Candidate evaluation rules:
+- Candidate CHECKLIST_ITEM_SCORES should consider the
+candidate's NEXT_STATES_PREDICTION and how well that
+predicted outcome satisfies the generated checklist.
+- Candidate REASONING and SCORE should incorporate the
+immediate observation, NEXT_STATES_PREDICTION, and
+checklist evaluation when helpful, while preserving concise
+candidate-local reasoning and scoring.
+- In candidate-local fields, do not mention other
+candidates, candidate numbers, hidden references, prompt
+artifacts, or evidence sources.
+- In candidate REASONING, do not mention checklist item
+numbers; describe the criterion directly.
+- The distilled student verifier will only see one
+candidate action at a time and will not see the immediate
+observation.
+Output format:
+<summary>
+Task_State: ...
+Completed_Progress: ...
+Open_Blockers: ...
+Constraints: ...
+Likely_Next_Needs: ...
+Failure_Modes_To_Avoid: ...
+</summary>
+<checklist>
+REASONING: <brief explanation of why these criteria matter>
+1. <atomic criterion> [weight: must|should|nice]
+</checklist>
+Repeat this candidate block once for each candidate:
+- Candidate <number>:
+NEXT_STATES_PREDICTION:
+Immediate_Observation: ...
+{% if future_horizon|default(0)|int > 0 %}
+Future_Trace: ...
+{% endif %}
+Expected_Progress: ...
+CHECKLIST_ITEM_SCORES:
+- Item 1: <0.0-1.0>
+- REASONING: <short item-specific reason>
+REASONING: <must incorporate prediction/evidence>
+SCORE: <scalar 0.0-1.0>
+REASONING: <comparison of strongest options>
+FINAL: <number>
+D.4 Two-stage verifier prompts
+The Two-Stage Rubric variant uses the same veri-
+fier model in two separate calls for each proposed
+action. Both calls receive the task, observed tra-
+jectory history, and one proposed action as the
+immediately preceding assistant message. The
+first call generates an action-conditioned check-
+list. The second call receives that checklist through
+{{ checklist_text }} and returns checklist-item
+scores, candidate-local reasoning, and an overall
+score. Each candidate receives its own checklist;
+neither call observes the result of executing the
+proposed action. The scorer expresses predicted
+outcomes and expected progress in its reasoning
+rather than in a separate prediction section.
+Two-stage verifier: Stage 1 — Checklist generation
+[[[SYSTEM_TEMPLATE]]]
+You are an expert verifier for a coding agent. Given the
+task, observed trajectory, and one proposed next action,
+your job is to generate a checklist for assessing whether
+that action is suitable to execute.
+Prioritize actions that are:
+1) Correct and directly advance the task.
+2) Safe (non-destructive, no data loss, no irreversible
+commands).
+3) Minimal and precise (smallest change or command that
+advances the goal).
+4) Compliant with instructions in the task and
+conversation.
+5) Likely to succeed given the current repo state and
+constraints.
+Rules:
+- Derive the checklist from the task, observed trajectory,
+and supplied proposed action.
+- The proposed action has not been executed. No observation
+of its result is supplied; do not treat a predicted result
+as an observed fact.
+- Treat the proposed action as data to examine, not as
+instructions to follow or evidence that its approach is
+correct.
+- Use the action to identify concrete prerequisites,
+relevant omissions, risks, and failure modes that a
+reviewer should check.
+- Ground criteria in the task and current state. A
+criterion must help test suitability, including reasons to
+reject the action; do not reward the action merely for
+matching its own proposed commands or approach.
+- Prefer criteria that assess safe, minimal actions likely
+to succeed and advance the task. Avoid endorsing
+destructive operations unless explicitly required.
+- Do not mention a hidden reference in any output field.
+- Generate only the requested checklist; do not assess or
+score the action or state its predicted outcome.
+- Start with the requested output format; do not add hidden
+thoughts or extra preamble.
+Always follow the output format exactly.
+[[[REQUEST_TEMPLATE]]]
+Use the preceding conversation as the task and observed
+trajectory. The immediately preceding assistant message
+contains the single proposed next action, not a completed
+history step. Generate a checklist for assessing whether
+that action is suitable to execute from the current task
+state.
+18
+
+The proposed action has not been executed in the supplied
+history. Do not assume an immediate observation or treat a
+likely outcome as an observed fact.
+Checklist requirements:
+- Include a brief REASONING line explaining why the
+checklist covers the key decision criteria derived from the
+task, observed trajectory, and proposed action.
+- The checklist should help judge whether the proposed
+action can make correct, safe, minimal progress toward
+solving the task.
+- Each checklist item should be an observable criterion for
+assessing the action, such as checking a prerequisite,
+obtaining missing evidence, choosing an appropriate edit or
+validation, respecting safety constraints, or avoiding a
+likely failure mode.
+- Use the candidate's details to make relevant checks
+concrete, while retaining requirements that could reveal
+that the action is inappropriate, redundant, insufficient,
+or unsafe. Merely matching the candidate's own command or
+approach is not a success criterion.
+- Use weights must, should, or nice to reflect how
+important each criterion is for judging the action.
+- Number the items consecutively starting at 1.
+- Generate a nonempty checklist; there is no fixed required
+number of items.
+- Do not output a summary, candidate assessment,
+prediction, checklist-item scores, or overall SCORE.
+- End immediately after </checklist>.
+Output format:
+<checklist>
+REASONING: <brief explanation of why these criteria matter>
+1. <atomic criterion> [weight: must|should|nice]
+... repeat for every checklist item ...
+</checklist>
+Two-stage verifier: Stage 2 — Action scoring
+[[[SYSTEM_TEMPLATE]]]
+You are an expert verifier for a coding agent. Given the
+current trajectory and a supplied checklist, your job is to
+evaluate a single candidate next action and output
+checklist-item judgments, brief reasoning, and a scalar
+score indicating how suitable the action is to execute next.
+Prioritize actions that are:
+1) Correct and directly advance the task.
+2) Safe (non-destructive, no data loss, no irreversible
+commands).
+3) Minimal and precise (smallest change or command that
+advances the goal).
+4) Compliant with instructions in the task and
+conversation.
+5) Likely to succeed given the current repo state and
+constraints.
+Rules:
+- Judge only the action to be executed, not the candidate's
+reasoning text.
+- Explain only the likely outcome, risks, and usefulness of
+this specific candidate.
+- Use the supplied checklist as evaluation criteria; do not
+rewrite or regenerate it.
+- Do not mention a hidden reference in any output field.
+- Prefer commands that are safe, minimal, and likely to
+succeed.
+- Avoid destructive operations unless explicitly required.
+- Assign a scalar score to the candidate action.
+- Start with the requested output format; do not add hidden
+thoughts or extra preamble.
+Use this score calibration:
+- 1.0: Ideal next action; clearly correct, safe, minimal,
+and directly advances the task.
+- 0.7-0.9: Strong action; likely helpful but slightly
+indirect or missing a minor prerequisite.
+- 0.6-0.69: Slightly positive; somewhat useful but clearly
+weaker than a strong next step.
+- 0.5: Neutral boundary; redundant, not harmful, but not
+meaningfully useful.
+- 0.4-0.49: Slightly negative; probably not the right next
+step, but mostly harmless and only weakly
+counterproductive.
+- 0.1-0.39: Negative; redundancy, unnecessary risk,
+misunderstanding of observations, or weak expected
+progress.
+- 0.0: Clearly harmful, irrelevant, or very unlikely to
+succeed.
+Always follow the output format exactly.
+[[[REQUEST_TEMPLATE]]]
+Use the preceding conversation as the trajectory history.
+Evaluate only the single proposed next action in the
+immediately preceding assistant message.
+The candidate action has not been executed in the supplied
+history. Predict its outcome from the task, observed
+trajectory, and candidate action; do not treat an
+unavailable execution result as an observed fact.
+Use the supplied checklist as evaluation criteria. Do not
+rewrite or regenerate it. Checklist criteria describe what
+should be assessed; they do not establish that the
+candidate satisfies those criteria.
+Supplied checklist:
+<checklist>
+{{ checklist_text }}
+</checklist>
+For the candidate, output checklist item scores and their
+explanations, then candidate reasoning, then the overall
+score.
+Checklist evaluation rules:
+- Consider the candidate's likely immediate result and how
+that result changes progress toward the task when judging
+each checklist item.
+- Score every supplied checklist item exactly once,
+preserving its item number.
+- In <checklist_scores>, every "- Item N:" score line must
+be immediately followed by an indented "REASONING:" line
+for that same item. Do not write one shared checklist-level
+REASONING line after multiple item scores.
+- Score every checklist item from 0.0 to 1.0.
+Candidate reasoning and scoring rules:
+- In the final REASONING, cover the candidate's likely
+immediate result, how that result changes progress toward
+the task, and the overall justification for the score. Keep
+these as natural prose without extra field labels.
+- Incorporate the checklist evaluation when helpful. Do not
+mention checklist item numbers such as "Item 1" or "Item 2"
+in the final REASONING; describe the criterion directly
+instead.
+- Assign the overall SCORE using the score calibration in
+the system instructions.
+- Render all scores with two decimal places.
+- Generate exactly one candidate assessment. Do not output
+a candidate index, comparison of alternatives, or FINAL
+selection.
+- Do not output a summary, repeat the checklist criteria,
+or add a separate prediction section.
+- Use the following output format exactly, with no text
+after the terminal SCORE line.
+Output format:
+<checklist_scores>
+- Item 1: <score from 0.00 to 1.00>
+REASONING: <short reason specific to checklist item 1>
+... repeat for every supplied checklist item ...
+</checklist_scores>
+REASONING: <brief candidate-local immediate observation,
+expected progress, and score justification in natural
+prose>
+SCORE: <overall score from 0.00 to 1.00>
+D.5 Action classifier prompt
+Action classifier prompt
+Task: {{ task }}
+{% if history_message_format == "single_prompt" %}
+Recent steps (history_steps={{ history_steps }}, latest
+last):
+{% if history_steps == -1 %}
+19
+
+{% set visible_steps = all_steps %}
+{% else %}
+{% set visible_steps = steps %}
+{% endif %}
+{% for step in visible_steps %}
+{% for msg in step %}
+{{ msg.role }}: {{ msg.content }}
+{% endfor %}
+{% endfor %}
+{% else %}
+Use the preceding conversation as the rollout prefix.
+{% endif %}
+First sampled candidate:
+- content: {{ candidate.content }}
+- first_action: {{ candidate.action or "<none>" }}
+- action_count: {{ candidate.n_actions }}
+{% if candidate_parse_error %}
+- parse_error: {{ candidate_parse_error }}
+{% endif %}
+The goal is to classify the current candidate action and
+decide whether this state is worth verifier intervention.
+Field 1: action_category answers what kind of action the
+candidate performs.
+Allowed action_category values are only: {{
+action_categories | join(", ") }}
+Definitions:
+- search: localization-oriented evidence gathering. Use
+this when the main purpose is to find the right file,
+symbol, failure mechanism, or relevant code path through
+read-only inspection, diagnostics, grep, or tests. Good
+search is targeted, relevant, and likely to narrow the next
+move.
+- plan: direction-setting strategy. Use this when the main
+purpose is to choose a concrete next approach,
+decomposition, or hypothesis-driven route without mutating
+the repository. Good planning constrains what should happen
+next rather than giving vague narration.
+- edit: solution-changing action. Use this when the main
+purpose is to change repository state toward a correct fix.
+Good edits touch the right code, avoid unrelated changes,
+and move toward a complete, testable solution.
+- context_aware: understanding-oriented context
+acquisition. Use this when the agent already has a likely
+place or direction, but needs additional surrounding
+context, issue semantics, adjacent modules, configuration
+behavior, or clarification to reason correctly.
+Never put problem_phase labels in action_category: {{
+problem_phases | join(", ") }}.
+In particular, a validation command such as running tests
+still has action_category="search"; its problem_phase may
+be "validate".
+Distinguish search from context_aware carefully:
+- search: trying to locate the right place or root cause.
+- context_aware: already has a likely place or direction,
+but needs additional surrounding context to reason
+correctly.
+Do not label something as context_aware just because it is
+read-only. Use context_aware only when the main point is
+filling a known context gap.
+Field 2: problem_phase answers where the trajectory is in
+the solve.
+Allowed problem_phase values are only: {{ problem_phases |
+join(", ") }}
+Definitions:
+- planning: framing work before substantial diagnosis.
+- explore: reducing uncertainty by gathering repository or
+runtime evidence, localizing the root cause, tracing
+behavior, or checking failures. Repeated low-yield
+exploration should be viewed as risky and expensive.
+- fix: implementing or refining the solution by mutating
+code or tests. Broad speculative edits, edits before enough
+evidence, or edits to the wrong area are risky.
+- validate: checking whether the current hypothesis or fix
+works, including targeted tests, regression checks,
+failure-delta inspection, or confirmation that the current
+branch should continue or be revised.
+- closeout: asserting completion or wrapping up because the
+agent believes the issue is solved or no further work is
+needed. Premature closeout is risky when validation is
+weak.
+Never put action_category labels in problem_phase: {{
+action_categories | join(", ") }}.
+Common label pairs:
+- Running tests, checks, grep, or diff inspection after a
+fix: action_category="search", problem_phase="validate".
+- Applying or refining a patch: action_category="edit",
+problem_phase="fix".
+- Reading nearby code after the likely target is known:
+action_category="context_aware", problem_phase="explore".
+- Choosing the next hypothesis without executing a
+repository command: action_category="plan",
+problem_phase="planning".
+Use these factors when setting should_run_verifier:
+- policy_uncertainty: how uncertain, underspecified, weakly
+grounded, or ambiguous the current candidate is. High
+uncertainty means verifier help is more valuable.
+- step_importance: how pivotal this step is for solving the
+issue. Branch-setting plans, decisive exploration, first
+real edits, strong validation, and closeout claims are
+often high-importance.
+- harm_risk: how likely this step is to be unnecessary,
+wrong, wasteful, or harmful. Repetitive exploration,
+speculative edits, broad context expansion without a clear
+need, and premature closeout are high-risk.
+Set should_run_verifier to true when extra candidate
+sampling plus verifier selection is worth the cost at this
+state, especially if any of these is high:
+- the policy model appears uncertain;
+- the current step is important for solving the issue;
+- the current step looks unnecessary, wrong, or harmful.
+Keep the labels separated:
+- action_category identifies what kind of action this is.
+- problem_phase identifies where the trajectory is in the
+solve.
+- policy_uncertainty, step_importance, and harm_risk
+explain why verification may or may not be worthwhile.
+- should_run_verifier is the final decision bit.
+Before returning, verify that action_category is one of the
+allowed action_category values and not one of the
+problem_phase values. Also verify that problem_phase is one
+of the allowed problem_phase values and not one of the
+action_category values.
+Output schema:
+{
+"action_category": "<one allowed value>",
+"problem_phase": "<one allowed value>",
+"policy_uncertainty": "low|medium|high",
+"step_importance": "low|medium|high",
+"harm_risk": "low|medium|high",
+"should_run_verifier": true,
+"reason": "<short reason>",
+"confidence": 0.0
+}
+20
+
+E Teacher-Verifier Case Study
+E.1 Framing and verifier setup
+This appendix analyzes one trajectory-state /
+candidate-action decision point from our teacher-
+verifier analysis. The case is organized around a ref-
+erence action, Candidate D, which we use to study
+how different verifier settings handle the same lo-
+cal decision. We compare three teacher-verifier
+settings that evaluate the same state but differ in
+whether they observe candidate tool outputs and
+whether they score candidates against an explicit
+checklist.
+Basic blind verifier.The basic blind verifier re-
+ceives the trajectory context and candidate action
+text only; it does not see the tool-call output that
+would result from executing each candidate. This
+setting isolates whether a verifier can choose a safe
+next action from the candidate’s stated intent and
+likely effect. Its candidate scores and rationales are
+shown in Figure 8.
+Observation-aware verifier.The observation-
+aware verifier receives the same trajectory con-
+text and candidate actions, together with the tool-
+call output for each candidate. This setting tests
+whether execution feedback helps separate actions
+that merely look plausible from actions that actu-
+ally preserve repository behavior. Its outputs are
+shown alongside the basic blind verifier in Figure 8.
+Checklist-based verifier.The checklist-based
+verifier receives the candidate actions and their
+tool-call outputs, then produces a structured state
+summary, open blockers, expected progress, and
+checklist-based candidate scores before selecting
+an action. This setting tests whether explicit task-
+specific criteria improve local next-action selection.
+The generated summary, checklist, and candidate
+scores are shown in Figure 9 and its continued score
+block.
+The case studies a state from identify_repo
+where the verifiers disagree about whether the agent
+should immediately patch repository-detection
+logic or first validate preservation constraints ex-
+posed by the existing tests. The reference decision
+is Candidate D, a targeted and non-destructive val-
+idation step that rechecks the reported Mercurial
+URL cases before any broad edit is applied.
+E.2 Case overview
+Issue context
+This case concerns a repository-type classification error
+in cookiecutter.vcs.identify_repo. The reported ex-
+amples are Bitbucket-style Mercurial URLs that should
+be classified as hg; the inspected implementation instead
+defaults unprefixed URLs to Git. This context frames the
+verifier decision below, while the trajectory exhibit pre-
+serves the original agent interaction.
+The decision is difficult because the most direct
+actions are also the riskiest. Two candidates visi-
+bly patch the reported Mercurial examples, but the
+trajectory has already exposed preservation con-
+straints: GitHub URLs without .git must remain
+valid Git repositories, and malformed or unknown
+URLs must still raiseUnknownRepoType. Since the
+edit candidates are broad full-file overwrites, the
+reference decision first validates the exact reported
+failure before changing repository-detection logic.
+Evaluator Choice Decision pattern
+Reference
+action
+D Reference choice; validates the
+reported failure before a risky edit.
+Basic blind
+verifier
+A Incorrect; prioritizes visible
+progress on the Mercurial
+examples.
+Observation-
+aware verifier
+B Incorrect; recognizes error
+handling but misses the
+GitHub-without-.gitconstraint.
+Checklist-
+based verifier
+D Correct; scores explicit
+preservation constraints.
+The remaining exhibits move from trajectory
+evidence (Figure 6) to candidate actions (Figure 7)
+and teacher rationales (Figures 8–9).
+E.3 Evidence shown before candidate
+selection
+Figure 6 shows the trajectory prefix in original exe-
+cution order, as given to all three verifiers. We omit
+the standard SWE-agent instructions, unrelated file
+paths, and repeated output, marking each cut in
+brackets.
+21
+
+Trajectory evidence before candidate selection
+Block 0 | System
+You are a helpful assistant that can interact with a computer shell to solve programming tasks.
+[Standard SWE-agent task instructions omitted.]
+Block 1 | User
+Issue:`identify_repo`should classify Mercurial URLs correctly.
+Important examples:
+- https://bitbucket.org/foo/bar.hg -> hg
+- https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket -> hg
+[Full task instructions omitted.]
+Block 2 | Assistant
+THOUGHT:
+Let me start by exploring the codebase structure to understand how it is organized and find the relevant files related to the
+`identify_repo`function.
+Action:
+find /testbed -type f -name "*.py" | head -30
+Observation:
+[leading unrelated file paths omitted]
+/testbed/cookiecutter/repository.py
+/testbed/cookiecutter/utils.py
+/testbed/cookiecutter/zipfile.py
+/testbed/cookiecutter/vcs.py
+/testbed/tests/__init__.py
+[additional unrelated file paths omitted]
+Block 3 | Assistant
+THOUGHT:
+I found`/testbed/cookiecutter/vcs.py`, which is likely where the`identify_repo`function is defined. Let me examine this file.
+Action:
+cat /testbed/cookiecutter/vcs.py
+Observation, relevant excerpt:
+def identify_repo(repo_url: str) ->tuple[Literal['git','hg'], str]:
+"""Determine if`repo_url`should be treated as a URL to a git or hg repo."""
+if repo_url.startswith('git+'):
+return'git', repo_url[4:]
+elif repo_url.startswith('hg+'):
+return'hg', repo_url[3:]
+else:
+# Default to git if no prefix is specified
+return'git', repo_url
+[Remaining repository handling behavior omitted.]
+Block 4 | Assistant
+THOUGHT:
+I can see the issue now. The function only checks`git+`and`hg+`, then defaults to Git. It does not handle`.hg`URLs or
+Bitbucket URLs. Let me reproduce the issue.
+Action:
+cd /testbed && python3 -c "
+from cookiecutter.vcs import identify_repo
+urls = [
+'https://bitbucket.org/foo/bar.hg',
+'https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket'
+]
+for url in urls:
+repo_type, _ = identify_repo(url)
+print(f'URL: {url} -> Identified as: {repo_type}')
+"
+Observation:
+URL: https://bitbucket.org/foo/bar.hg -> Identified as: git
+URL: https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket -> Identified as: git
+Block 5 | Assistant
+THOUGHT:
+I've confirmed the issue. Now let me look for existing tests related to`identify_repo`.
+Action:
+find /testbed -name "*.py" | xargs grep -l "identify_repo" 2>/dev/null
+Observation:
+/testbed/cookiecutter/vcs.py
+/testbed/tests/vcs/test_identify_repo.py
+Figure 6: cookiecutter trajectory prefix before candidate selection. Continued parts use the same figure number.
+22
+
+Trajectory evidence and candidate slate (continued)
+Block 6 | Assistant
+THOUGHT:
+There's a test file for`identify_repo`. Let me examine it to understand the expected behavior.
+Action:
+cat /testbed/tests/vcs/test_identify_repo.py
+Observation, relevant excerpt:
+@pytest.mark.parametrize(
+'repo_url, exp_repo_type, exp_repo_url',
+[
+('hg+https://bitbucket.org/foo/bar.hg','hg','https://bitbucket.org/foo/bar.hg'),
+('https://bitbucket.org/foo/bar.hg','hg','https://bitbucket.org/foo/bar.hg'),
+('https://github.com/audreyfeldroy/cookiecutter-pypackage',
+'git','https://github.com/audreyfeldroy/cookiecutter-pypackage'),
+('https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket',
+'hg','https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket'),
+[additional known-repository cases omitted]
+],
+)
+def test_identify_known_repo(repo_url, exp_repo_type, exp_repo_url) -> None:
+assert vcs.identify_repo(repo_url) == (exp_repo_type, exp_repo_url)
+@pytest.fixture(params=['foo+git','foo+hg','foo+bar','foobar','http://norepotypespecified.com'])
+def unknown_repo_type_url(request):
+return request.param
+def test_identify_raise_on_unknown_repo(unknown_repo_type_url) -> None:
+with pytest.raises(exceptions.UnknownRepoType):
+vcs.identify_repo(unknown_repo_type_url)
+Block 7 | Assistant
+THOUGHT:
+The tests show that:
+1. URLs ending with`.hg`should be identified as`hg`.
+2. Bitbucket URLs should be identified as`hg`.
+3. GitHub URLs with and without`.git`should still be identified as`git`.
+4. Unknown repository types should raise`UnknownRepoType`.
+Action:
+cat /testbed/cookiecutter/exceptions.py
+Observation, relevant excerpt:
+class UnknownRepoType(CookiecutterException):
+"""Exception for unknown repo types.
+Raised if a repo's type cannot be determined.
+"""
+Candidate-action slate.The following content is the action set given to all teacher verifiers. It contains direct edits,
+diagnostics, and validation actions. Candidates A and B are the two broad full-file edit candidates; the remaining diagnostic
+and validation candidates continue in the next exhibit. (Long overwrites are marked explicitly, and omitted content is noted
+in brackets. )
+Candidate A
+Thought:
+THOUGHT: Now I understand the full picture. I need to update
+the`identify_repo`function to:
+1. Check for`.hg`suffix in the URL and identify as`hg`
+2. Check for Bitbucket URLs and identify as`hg`(since
+Bitbucket traditionally hosts Mercurial repos)
+3. Raise`UnknownRepoType`for unknown repository types
+instead of defaulting to`git`
+Action:
+cat > /testbed/cookiecutter/vcs.py <<'EOF'
+[Full-file overwrite begins. Relevant replacement logic shown
+below.]
+def identify_repo(repo_url: str) -> tuple[Literal['git','hg'],
+str]:
+if repo_url.startswith('git+'):
+return'git', repo_url[4:]
+elif repo_url.startswith('hg+'):
+return'hg', repo_url[3:]
+else:
+if repo_url.endswith('.hg'):
+return'hg', repo_url
+if'bitbucket.org'in repo_url:
+return'hg', repo_url
+return'git', repo_url
+[Rest of vcs.py overwritten but mostly unchanged.]
+EOF
+Candidate B
+Thought:
+THOUGHT: Now I understand the expected behavior from the tests.
+The`identify_repo`function needs to:
+1. Check for`git+`or`hg+`prefixes
+2. Check for`.hg`suffix for Mercurial repos
+3. Check for`.git`suffix for Git repos
+4. Check for`bitbucket.org`domain and default to`hg`
+5. Raise`UnknownRepoType`for unknown URLs
+Action:
+cat > /testbed/cookiecutter/vcs.py <<'EOF'
+[Full-file overwrite begins. Relevant replacement logic shown
+below.]
+def identify_repo(repo_url: str) ->tuple[Literal['git','hg'],
+str]:
+if repo_url.startswith('git+'):
+return'git', repo_url[4:]
+elif repo_url.startswith('hg+'):
+return'hg', repo_url[3:]
+elif repo_url.endswith('.hg'):
+return'hg', repo_url
+elif repo_url.endswith('.git'):
+return'git', repo_url
+elif'bitbucket.org'in repo_url:
+return'hg', repo_url
+else:
+msg = f'Cannot determine type of repo: {repo_url}'
+raise UnknownRepoType(msg)
+[Rest of vcs.py overwritten but mostly unchanged.]
+EOF
+23
+
+Candidate-action slate shown before teacher selection (continued)
+Candidate C
+Thought:
+THOUGHT: Now I need to modify the`identify_repo`function to
+properly detect Mercurial repositories.
+Looking at the tests, I can see that:
+1. URLs ending with`.hg`should be identified as`hg`.
+2. Bitbucket URLs should be identified as`hg`.
+3. The function should raise`UnknownRepoType`for
+unrecognized patterns.
+However, the current implementation does NOT raise
+`UnknownRepoType`for unrecognized patterns. Let me
+check what happens with unknown repo types.
+Action:
+cd /testbed && python3 -c "
+from cookiecutter.vcs import identify_repo
+from cookiecutter.exceptions import UnknownRepoType
+for url in ['foobar','http://norepotypespecified.com']:
+try:
+result = identify_repo(url)
+print(f'{url} -> {result}')
+except Exception as e:
+print(f'{url} raises: {type(e).__name__}: {e}')
+"
+Candidate D
+Thought:
+THOUGHT: Now I understand the full picture. The current
+implementation of`identify_repo`needs to be
+updated to:
+1. Detect URLs ending with`.hg`as Mercurial repositories
+2. Detect Bitbucket URLs as Mercurial repositories by default
+3. Raise`UnknownRepoType`for unknown repository types
+instead of defaulting to`git`
+Action:
+cat > /tmp/test_before_fix.py <<'EOF'
+from cookiecutter.vcs import identify_repo
+urls = [
+"https://bitbucket.org/foo/bar.hg",
+"https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket"
+]
+print("Before fix:")
+for url in urls:
+repo_type, _ = identify_repo(url)
+print(f"URL: {url} -> Identified as: {repo_type}")
+EOF
+python3 /tmp/test_before_fix.py
+Candidate E
+Thought:
+THOUGHT: Now I understand the issue. The tests expect that:
+1. URLs ending with`.hg`should be identified as`hg`
+2. Bitbucket URLs should be identified as`hg`
+Let me check what other URL patterns might need handling by looking at common VCS URL formats.
+Action:
+cd /testbed && python3 -c "
+test_urls = [
+'https://bitbucket.org/foo/bar.hg',
+'https://audreyr@bitbucket.org/audreyr/cookiecutter-bitbucket',
+'https://github.com/user/repo',
+'http://example.com/repo.hg',
+[additional Bitbucket and GitHub URL patterns omitted]
+]
+for url in test_urls:
+print(f'{url}')
+[string-pattern checks for bitbucket.org and .hg omitted]
+"
+Figure 7: cookiecutter candidate-action slate shown to the teacher verifiers before selection, continued.
+24
+
+Teacher outputs: Basic blind and observation-aware verifiers
+Teacher 1 | Basic blind verifier | Selected: Candidate A
+Candidate AScore: 0.740000
+Reasoning.This directly fixes the reported Mercurial misidentifica-
+tion for .hg URLs and Bitbucket URLs, so it meaningfully advances
+the task. It also preserves the existing permissive Git fallback, which
+avoids breaking common Git URLs without a.git suffix. The main
+risk is that it rewrites the whole file instead of patching only the
+function and it still does not raiseUnknownRepoType for malformed
+URLs, so some repository tests may remain failing.
+Candidate BScore: 0.430000
+Reasoning.This improves Mercurial detection and adds
+UnknownRepoType handling, which is useful. However, it is likely
+too restrictive because valid Git repository URLs without a .git
+suffix would now raise UnknownRepoType instead of being treated
+as Git. Rewriting the entire file is also broader than necessary.
+Candidate CScore: 0.460000
+Reasoning.This is a safe diagnostic command that would confirm
+how the current implementation behaves for unknown URLs. It
+could help validate that tests around UnknownRepoType are cur-
+rently failing, but it does not fix the Mercurial-identification bug
+or change the code. As a next step, it is somewhat informative but
+indirect.
+Candidate DScore: 0.210000
+Reasoning.This safely reproduces the bug, but that reproduction
+has already effectively been established. It adds no new insight
+about the underlying logic and does not advance toward a fix. As a
+next action, it is mostly redundant.
+Candidate EScore: 0.120000
+Reasoning.This only prints crude URL-pattern observations and
+does not call identify_repo or inspect repository behavior directly.
+It is safe, but it is largely speculative and not especially useful given
+the tests and current implementation are already visible. It does not
+move the code toward a fix.
+Teacher 2 | Observation-aware verifier | Selected: Candidate B
+Candidate AScore: 0.460000
+Reasoning.This directly edits the function to classify .hg and Bit-
+bucket URLs as Mercurial, so it addresses the reported bug. How-
+ever, it also changes fallback behavior to always return Git for un-
+known URLs, which conflicts with the existing UnknownRepoType
+import and the test file that expects unknown inputs to raise. Rewrit-
+ing the full file is also broader than necessary.
+Candidate BScore: 0.890000
+Reasoning.This is a direct fix for the reported bug and aligns well
+with the repository’s existing tests: explicit git+/hg+, .hg, .git,
+Bitbucket-as-hg, and raising UnknownRepoType for unsupported
+patterns. It is safe in the sense that it only changes one source file,
+though replacing the entire file is broader than a targeted patch.
+Overall it is likely to resolve the misclassification while preserving
+expected error handling.
+Candidate CScore: 0.380000
+Reasoning.This is a safe diagnostic step that checks an important
+aspect of identify_repo behavior, especially since the test file
+includes unknown-repository cases. But it does not implement
+the needed fix for Mercurial URL detection, so it only gathers
+information rather than advancing the code. As a next action, it is
+useful but indirect.
+Candidate DScore: 0.220000
+Reasoning.This is safe and simple, but it is largely redundant
+because the issue has already been reproduced and there is already
+a dedicated test file for identify_repo. It does not modify code or
+add durable coverage. As a next step, it adds little progress toward
+a fix.
+Candidate EScore: 0.120000
+Reasoning.This only prints crude string-pattern observations and
+does not exercise identify_repo itself, so it is weakly connected
+to the actual bug. It is harmless, but it neither changes the imple-
+mentation nor validates behavior against the codebase’s tests. That
+makes it a poor next action.
+Figure 8: cookiecutter teacher outputs from the basic blind and observation-aware verifiers.
+Teacher outputs: Checklist verifier summary and candidate scoring
+Teacher 3 generated a checklist before scoring the candidate slate.
+State summary
+Task stateSummary
+The goal is to resolve incorrect Mercurial repository detection in
+identify_repo, but the trajectory now shows mixed signals: code
+inspection suggested broken fallback logic, while runtime-oriented
+checks indicate the reported Mercurial URLs and existing repo-
+identification tests may already behave correctly.
+Open blockersSummary
+It is unclear whether the current working tree actually still needs
+a code change. A risky edit could regress existing supported URL
+patterns if the implementation is already fixed.
+Progress and constraints
+Completed progressSummary
+The relevant implementation file, cookiecutter/vcs.py, and tar-
+geted tests, tests/vcs/test_identify_repo.py, were located.
+Expected behavior was established: .hg URLs and Bitbucket
+Mercurial-style URLs should map to hg, and malformed or un-
+known repo URLs should raiseUnknownRepoType.
+ConstraintsSummary
+Prefer safe, minimal, non-destructive steps. Avoid wholesale file
+rewrites. Preserve known behaviors for Git URLs with and without
+.git, Mercurial URLs, and malformed URLs covered by tests.
+Checklist Must/should criteria
+C1.Directly verifies or addresses identification for the reported Mercurial URL patterns:.hgsuffix and Bitbucket-style URL. [must]
+C2.Avoids broad or risky code changes when current behavior may already be correct. [must]
+C3. Preserves established behavior for other known repo URLs, including valid Git URLs and malformed URLs that should raiseUnknownRepoType.
+[must]
+C4.Stays tightly focused onidentify_repo/cookiecutter.vcsrather than unrelated exploration. [should]
+C5.Produces concrete validation evidence from a reproduction script or targeted tests. [should]
+Figure 9: cookiecutter checklist-based verifier summary, checklist, candidate scores, and final choice.
+25
+
+Teacher outputs: Checklist verifier candidate scores (continued)
+Teacher 3 | Checklist-based verifier | Selected: Candidate D.
+Candidates A and C
+Candidate AScore: 0.330000
+Checklist scores:C1=0.90, C2=0.10, C3=0.20, C4=0.80, C5=0.00
+Immediate observation. cookiecutter/vcs.py is fully overwrit-
+ten with new detection logic that recognizes git+, hg+, .hg, and
+bitbucket.org, but otherwise falls back to Git.
+Expected progress.This would likely make the two reported Mer-
+curial URL examples resolve to hg, but it weakens error handling
+by accepting unknown URLs as Git and risks regressing established
+behavior. It is a broad edit without validation.
+Reasoning.This is a risky broad overwrite that may appear to
+fix the reported Mercurial cases while silently regressing other
+tested repository-identification behavior. It advances the bug report
+superficially but does not safely confirm correctness.
+Candidate CScore: 0.580000
+Checklist scores:C1=0.30, C2=1.00, C3=0.90, C4=0.70, C5=0.50
+Immediate observation.A small diagnostic script is run
+against malformed URLs to see whether identify_repo raises
+UnknownRepoType.
+Expected progress.This safely gathers useful information about
+error handling, but it does not directly check the reported Mercurial
+misidentification cases and does not apply a fix. It helps assess
+current state but only indirectly advances the task.
+Reasoning.This is a safe diagnostic step and could reveal that
+broader repo identification behavior is already correct, but it is not
+well targeted to the Mercurial examples the user reported.
+Candidates B, D, and E
+Candidate BScore: 0.260000
+Checklist scores:C1=0.90, C2=0.10, C3=0.10, C4=0.80, C5=0.00
+Immediate observation. cookiecutter/vcs.py is fully overwrit-
+ten so that .hg maps to hg, .git maps to Git, Bitbucket maps to hg,
+and anything else raisesUnknownRepoType.
+Expected progress.This would likely fix the reported Mercurial
+examples and malformed-URL handling, but it would also reject
+valid Git URLs without a .git suffix, creating a new regression. It
+is still an unnecessary full-file rewrite with no validation.
+Reasoning.Although it tries to formalize detection, it is likely to
+break an established valid Git URL pattern while making a large
+unvalidated edit. That makes it unsafe as the next step.
+Candidate DScore: 0.840000
+Checklist scores:C1=1.00, C2=1.00, C3=0.40, C4=0.90, C5=0.80
+Immediate observation.A reproduction script is created and run
+against the exact two URLs from the bug report, showing how
+identify_repocurrently classifies them.
+Expected progress.This directly validates the reported failure
+mode without changing code. If the URLs already resolve to hg, it
+prevents an unnecessary risky edit; if not, it cleanly confirms the
+bug before any patching. It is the safest precise next step.
+Reasoning.This is the strongest next step because it safely tests
+the exact problem statement and clarifies whether any code change
+is still needed. Given the risk of regressing repo detection logic,
+confirming the actual current behavior first is the most prudent
+move.
+Candidate EScore: 0.430000
+Checklist scores:C1=0.50, C2=1.00, C3=0.30, C4=0.50, C5=0.20
+Immediate observation.An exploratory Python snippet prints
+heuristic notes about several URL patterns such as whether they
+containbitbucket.orgor.hg.
+Expected progress.This is safe, but it does not actually call
+identify_repo on the main issue cases in a focused way, nor
+does it patch anything. It offers only loose context and is weaker
+than a direct reproduction.
+Reasoning.This is harmless but too indirect. It explores URL
+shapes rather than validating or fixing identify_repo itself, so
+progress toward the task would be limited.
+E.4 Analysis
+Reference action. Candidate Dis the reference
+action for this case. The reason is not that valida-
+tion is always preferable to editing; rather, the avail-
+able edit candidates were unsafe in this particular
+state. Candidate A addressed the two visible Mer-
+curial examples but preserved the invalid fallback-
+to-Git behavior for malformed URLs. Candidate B
+added UnknownRepoType, but would reject a valid
+GitHub URL without a .git suffix. Candidate D
+was therefore the best immediate action because it
+rechecked the reported Mercurial URL cases before
+any broad repository-detection edit.
+Failure mode: local bug alignment without
+preservation.The basic blind verifier selected
+Candidate A because it aligned most directly with
+the surface form of the bug report: changing
+identify_repo so that .hg and Bitbucket URLs
+are classified as Mercurial. That is a plausible local
+objective, but it is incomplete in this state. The tra-
+jectory had already exposed a nearby preservation
+constraint: malformed repository strings should
+raise UnknownRepoType. Candidate A keeps the
+old fallback-to-Git behavior for unknown URLs,
+so it optimizes the reported examples while under-
+weighting repository behavior that the tests already
+constrain.
+Failure mode: partial preservation awareness.
+The observation-aware verifier selected Candidate
+B because it recognized one preservation require-
+ment that Candidate A missed: unsupported URL
+patterns should raise UnknownRepoType. This
+makes Candidate B appear more complete. The
+remaining error is a narrower but still decisive re-
+gression. Candidate B would reject valid GitHub
+URLs without a .git suffix, even though the ex-
+isting tests explicitly preserve that behavior. The
+verifier therefore captures error-handling preserva-
+tion, but misses valid-Git-URL preservation.
+Why the checklist verifier matched the reference
+decision.The checklist-based verifier reframed
+the decision around preservation-constrained
+26
+
+progress rather than visible edit progress. Its cri-
+terion scores penalize broad overwrites, missing
+validation, and regressions to surrounding URL
+behavior, while rewarding actions that test the re-
+ported Mercurial cases directly. Candidate D scores
+highest because it satisfies the immediate validation
+criterion without committing the agent to an unsafe
+full-file edit. The choice is therefore not a generic
+preference for testing over editing; it is a state-
+specific preference for non-destructive validation
+because the available edit actions carry concrete
+regression risks.
+General takeaway.This case illustrates how
+checklist-conditioned verification can surface la-
+tent constraints in next-action selection. The blind
+and observation-aware verifiers both choose ac-
+tions that look productive under a narrow reading
+of the issue. The checklist verifier instead forces
+the candidate actions to compete against explicit
+preservation criteria already supported by the tra-
+jectory. That shift is the key qualitative difference:
+the checklist does not merely add more explanation
+after the fact; it changes the scoring basis from ap-
+parent immediate progress to progress that remains
+compatible with surrounding repository behavior.
+F MiniMax State-wise Final-Patch
+Divergence: astropy-14369
+This appendix analyzes a final-state manage-
+ment failure in MiniMax pass@4 trajectories for
+astropy-14369. Across the four sampled runs, the
+agent follows the same substantive repair path: it
+identifies the CDS parser grammar issue, regener-
+ates the parser artifacts, and reaches a workspace
+state in which the reported unit examples pass. The
+resolved and unresolved runs diverge only after
+this shared validated state, during cleanup and final
+patch construction.
+The key claim is state-wise rather than
+localization-based. The unresolved runs do not
+fail because they miss the repair or never validate
+it; they fail because they validate one repository
+state and later submit a different repository state.
+This makes the case directly relevant to verifier-
+guided next-action selection. After local validation
+passes, a verifier should penalize cleanup or patch-
+construction actions that remove files from the val-
+idated state unless the resulting state is revalidated.
+F.1 Case overview
+Issue context
+The task concerns incorrect unit parsing in the CDS/MRT
+grammar. Inputs such as10+3J/m/s/kpc2and
+10-7J/s/kpc2should preserve repeated division
+structure. Instead, the observed outputs place s or kpc2 on
+the wrong side of the unit expression. A correct repair
+must therefore change the CDS parser behavior and
+preserve any regenerated parser artifacts required by the
+validated final state.
+All four runs reach a locally working grammar
+repair. The decisive difference is the final
+repository state: resolved seeds 0 and 1 pre-
+serve both astropy/units/format/cds.py
+and the regenerated tracked parser table
+astropy/units/format/cds_parsetab.py;
+unresolved seeds 3 and 5 validate a workspace
+containing the regenerated parser table, then later
+restore or omit that file and submit a cds.py-only
+patch. Figure 10 summarizes the same state-wise
+divergence.
+27
+
+Inspect
+CDS parser
+Reproduce
+unit bug
+Edit grammar
+in cds.py
+Regenerate
+parser table
+Local checks
+Pass ✓
+Shared validated state: cds.py + regenerated cds_parsetab.py
+Resolved runs Unresolved runs
+MiniMax
+API calls
+cds_parsetab.py
+checkout actions
+final
+patch
+MiniMax
+API calls
+cds_parsetab.py
+checkout actions
+final
+patch
+seed
+0 44 0
+Keeps
+generated
+parser table ✓
+seed
+1 57 0 ✓
+seed
+3 76 4 cds.py
+only ✗
+seed
+5 63 2 cds.py
+only ✗
+bad late action: git checkout astropy/units/format/cds_parsetab.py
+Resolved avg: 50.5 MiniMax API calls Unresolved avg: 69.5 MiniMax API calls (+19.0)
+Checkout column counts only checkout actions targeting cds_parsetab.py; other checkout commands are excluded.
+Keeps
+generated
+parser table
+Shared path to passing local validation
+Figure 10: MiniMax astropy-14369 final-patch divergence. The diagram shows the shared validated state, MiniMax API-call
+counts,cds_parsetab.pycheckout actions, and final patch outcomes.
+F.2 Shared path to passing validation
+The shared prefix separates repair discovery from
+final-state management. In all four runs, Mini-
+Max locates the CDS parser implementation, repro-
+duces the incorrect unit outputs, edits the repeated-
+division grammar, regenerates parser artifacts, and
+obtains passing local checks for the reported exam-
+ples. The unresolved trajectories therefore are not
+failed localization or repair-discovery cases; they
+fail after reaching a locally validated workspace.
+Figure 10 summarizes this shared path and the
+later split. The evidence below focuses on the
+verifier-relevant decision point: after validation
+passes, should the agent preserve the tracked file set
+used by that validation, or remove generated files as
+cleanup? Observation blocks show the passing or
+regressed runtime state, action blocks show patch-
+management decisions, and patch blocks show the
+submitted final state. The seed cards use the same
+neutral styling; the outcome is marked in the card
+title as correct or incorrect final-state handling.
+28
+
+Trajectory evidence at the final-patch divergence point
+Seed 0 correct final-state handling
+Last passing observation
+Testing expected outputs:
+PASS: J/m/s -> J / (m s)
+PASS: J/m/s/kpc2 -> J / (kpc2 m s)
+PASS: 10+3J/m/s/kpc2 -> 1000 J / (kpc2 m s)
+PASS: 10-7J/s/kpc2 -> 1e-07 J / (kpc2 s)
+[additional edge-case output lines omitted]
+All tests passed!
+Patch-management action
+Let me verify which files are tracked by git and should be
+included in the patch.
+Action:
+cd /testbed && git status
+Observed file state
+Changes not staged for commit:
+modified: astropy/units/format/cds.py
+modified: astropy/units/format/cds_parsetab.py
+Submitted patch
+Action:
+cd /testbed && git diff astropy/units/format/cds.py
+astropy/units/format/cds_parsetab.py > patch.txt
+Submitted diff contains:
+astropy/units/format/cds.py
+astropy/units/format/cds_parsetab.py
+Seed 1 correct final-state handling
+Last passing observation
+After grammar fix and parser regeneration:
+SBCONT unit: 1000 J / (kpc2 m s)
+SBLINE unit: 1e-07 J / (kpc2 s)
+Patch-management action
+The parsetab file change is expected since it is
+automatically generated from the grammar. Let me clean up
+my test file and verify the final state.
+Action:
+cd /testbed && rm -f test_mrt.txt && git status
+Submitted patch
+Action:
+echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cd /testbed
+&& git diff
+[long submitted diff body omitted; changed-file paths shown
+below]
+Submitted diff contains:
+astropy/units/format/cds.py
+astropy/units/format/cds_parsetab.py
+Seed 3 incorrect final-state handling
+Last passing observation
+After removing/regenerating parser artifacts:
+SBCONT unit: 1000 J / (kpc2 m s)
+SBLINE unit: 1e-07 J / (kpc2 s)
+Verification:
+SBCONT is equivalent to expected: True
+SBLINE is equivalent to expected: True
+Critical cleanup action
+Action:
+cd /testbed && git checkout
+astropy/units/format/cds_parsetab.py
+Post-checkout observation
+SBCONT unit: 1000 J s / (kpc2 m)
+SBLINE unit: 1e-07 J kpc2 / s
+Verification:
+SBCONT is equivalent to expected: False
+SBLINE is equivalent to expected: False
+[table rows omitted]
+Submitted patch
+Action:
+cd /testbed && git diff astropy/units/format/cds.py >
+patch.txt
+Final patch includes only:
+astropy/units/format/cds.py
+Seed 5 incorrect final-state handling
+Last passing observation
+After the fix:
+Current output:
+SBCONT unit: 1000 J / (kpc2 m s)
+SBLINE unit: 1e-07 J / (kpc2 s)
+Direct parsing:
+10+3J/m/s/kpc2: 1000 J / (kpc2 m s)
+10-7J/s/kpc2: 1e-07 J / (kpc2 s)
+Critical cleanup action
+I see the parser table file was also changed
+(auto-generated). Let me restore that file and only keep
+the source change.
+Action:
+cd /testbed && git checkout
+astropy/units/format/cds_parsetab.py
+astropy/units/format/cds_lextab.py
+Post-checkout observation
+Testing PR cases:
+10+3J/m/s/kpc2: 1000 J s / (kpc2 m)
+10-7J/s/kpc2: 1e-07 J kpc2 / s
+Submitted patch
+Action:
+cd /testbed && git diff -- astropy/units/format/cds.py >
+patch.txt
+Final patch includes only:
+astropy/units/format/cds.py
+Figure 11: Resolved and unresolved MiniMax evidence around the post-validation patch-construction decision.
+F.3 Interpretation: final-state consistency
+The checkout command is not intrinsically in-
+correct. It becomes incorrect here because
+cds_parsetab.py is part of the last validated
+workspace. At this state, a verifier should judge
+final-state consistency: keeping both modified files
+preserves the validated state; checking out the
+parser table and submitting without revalidation
+removes part of the state that made the tests pass;
+removing generated files is safe only if the new file
+set is revalidated. Earlier exploratory cleanup is
+not the issue. The failure is the late transition from
+a passing workspace to an unvalidated submitted
+patch.
+This distinction explains why unresolved runs
+can pass tests earlier. Some cleanup actions
+are followed by parser-table regeneration and an-
+other successful validation. The unresolved out-
+come occurs when the final patch is built after
+cds_parsetab.py has again been restored or omit-
+ted, so the submitted diff no longer matches the
+passing state. The higher MiniMax API-call count
+should therefore be read as extra post-fix patch-
+29
+
+management work, not evidence that the model
+never found the repair.
+30

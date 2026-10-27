@@ -1,0 +1,10 @@
+work/
+.venv*/
+*.egg-info/
+__pycache__/
+*.pyc
+.env
+.env.*
+configs/*.local.json
+device-records/
+*.log

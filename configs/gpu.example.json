@@ -1,0 +1,233 @@
+{
+  "study_id": "d3-bidirectional-trajectory-best-of-3",
+  "status": "gpu_implementation_awaiting_target_validation",
+  "execution_enabled": false,
+  "selection_level": "completed_trajectory_final_patch",
+  "train_or_finetune_models": false,
+  "models": {
+    "decision_large": {
+      "repo": "vllm-sr/d3",
+      "release_ref": "v3.1.0",
+      "revision": "cbff3a3cb0b074b6585fe9f747b9f9f5557a0e75",
+      "interface": "native_system_one_choice",
+      "precision": "bfloat16",
+      "declared_parent_repo": "Qwen/Qwen3.8-27B",
+      "parent_initialization_revision": null,
+      "deployment": "self_host_pinned_weights_not_public_d3_alias"
+    },
+    "decision_small": {
+      "repo": "vllm-sr/d3-flash",
+      "release_ref": "v3.1.0",
+      "revision": "521525effa79469d899a570726547dd7f00da3af",
+      "interface": "native_system_one_choice",
+      "precision": "bfloat16",
+      "declared_parent_repo": "Qwen/Qwen3.5-9B",
+      "parent_initialization_revision": null
+    },
+    "generator_small": {
+      "repo": "Qwen/Qwen3.5-9B",
+      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "checkpoint_type": "declared_direct_parent_of_decision_small_post_trained",
+      "interface": "official_chat_template",
+      "precision": "bfloat16",
+      "thinking": true,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      },
+      "history_reasoning_policy": "official_template_excludes_prior_thinking",
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0
+    },
+    "generator_large": {
+      "repo": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "checkpoint_type": "declared_direct_parent_of_decision_large_post_trained",
+      "interface": "official_chat_template",
+      "precision": "bfloat16",
+      "thinking": true,
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "preserve_thinking": true
+      },
+      "reasoning_effort": "xhigh",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0
+    }
+  },
+  "model_pairing": {
+    "definition_of_base": "direct upstream generative checkpoint declared by decision model author; not restricted to pretraining-only checkpoints",
+    "evidence_level": "author_declared_parent_repo_not_independently_verified_exact_training_initialization_commit",
+    "provenance_documents": "MODEL_PAIRS.md and model-provenance/",
+    "public_api_d3_alias_allowed": false
+  },
+  "dataset": {
+    "repo": "princeton-nlp/SWE-bench_Verified",
+    "revision": null,
+    "pilot_tasks": 50,
+    "debug_tasks": "1-2 non-overlapping train/dev tasks; manifest to prepare on target device",
+    "sampling_seed": 42,
+    "sampling_algorithm": "exclude then sort instance_id; seeded shuffle; take first 50",
+    "excluded_previously_inspected_instances": [
+      "django__django-14672",
+      "sphinx-doc__sphinx-10449",
+      "django__django-11299",
+      "django__django-14493",
+      "django__django-11551",
+      "django__django-12143",
+      "pydata__xarray-6938",
+      "django__django-15916",
+      "django__django-12193",
+      "pytest-dev__pytest-5262"
+    ],
+    "manifest_sha256": null
+  },
+  "candidate_pool": {
+    "main_n": 3,
+    "independent_containers": true,
+    "shared_across_decision_models": true,
+    "resample_invalid_or_duplicate_candidates": false,
+    "primary_preserves_duplicate_slots": true,
+    "seed_derivation": "sha256(study_seed, instance_id, generator_id, candidate_index, step)",
+    "study_seed": 42
+  },
+  "rollout_limits": {
+    "decision_steps": 100,
+    "max_consecutive_format_errors": 3,
+    "command_timeout_seconds": 120,
+    "active_rollout_timeout_seconds": 3600,
+    "model_request_timeout_seconds": 600,
+    "max_new_tokens_per_action": 16384,
+    "output_limit_includes_reasoning_and_final": true,
+    "record_reasoning_and_final_separately": true,
+    "parse_actions_from": "final_content_only_not_reasoning",
+    "no_final_content_on_length_limit_status": "generation_truncated_before_action",
+    "generator_max_context_tokens": 32768,
+    "max_total_generated_tokens_per_rollout": 131072,
+    "transport_attempts": 2,
+    "note": "Debug and pilot both use complete trajectory Best-of-3. Freeze limits after target debug and before the 50-task pilot."
+  },
+  "decision_input": {
+    "profile": "issue_complete_diff_recorded_evidence",
+    "common_question_context_budget_tokens": 32768,
+    "verify_both_model_actual_limits": true,
+    "observed_output_excerpt_chars_per_candidate": 8000,
+    "truncate_issue_or_diff": false,
+    "model_generated_summary": false,
+    "show_generator_identity_or_seed": false,
+    "show_official_evaluation_labels": false,
+    "same_randomized_order_for_both_judges": true,
+    "decision_failure_policy": "selected_id=null; failure in full-system primary metric; report infrastructure and valid-decision metrics separately"
+  },
+  "evaluation": {
+    "harness": "official SWE-bench 5.0.2",
+    "evaluate_all_candidates": true,
+    "seal_decisions_before_label_access": true,
+    "gold_fields_available_to_generators_or_decision_models": false
+  },
+  "expected_primary_workload": {
+    "generator_rollouts": 300,
+    "decision_calls_max": 200,
+    "candidate_evaluations_max": 300
+  },
+  "target_device": {
+    "gpu_model": null,
+    "gpu_count": null,
+    "vram_gib": null,
+    "cpu": null,
+    "ram_gib": null,
+    "serving_versions": null,
+    "job_manager": null
+  },
+  "must_freeze_before_pilot": [
+    "all_model_revisions",
+    "checkpoint_training_stage",
+    "dependency_lockfiles",
+    "dataset_revision_and_manifests",
+    "precision",
+    "generation_templates",
+    "reasoning_strategy",
+    "sampling_parameters",
+    "limits",
+    "decision_context_limits",
+    "evidence_extractor",
+    "failure_policy",
+    "hardware_manifest",
+    "total_budget",
+    "analysis_spec"
+  ],
+  "runtime": {
+    "workspace": "../work",
+    "hf_cache_dir": null,
+    "debug_tasks": 2,
+    "debug_dataset": "princeton-nlp/SWE-bench",
+    "debug_dataset_revision": null,
+    "debug_split": "dev",
+    "image_pull_timeout_seconds": 3600,
+    "docker": {
+      "executable": "docker",
+      "memory": "8g",
+      "cpus": 4,
+      "pids_limit": 1024
+    },
+    "evaluation": {
+      "python": null,
+      "max_workers": 1,
+      "timeout_seconds": 1800
+    },
+    "generator_services": {
+      "generator_small": {
+        "base_url": "http://127.0.0.1:8001/v1",
+        "served_model_name": "Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "api_key_env": null
+      },
+      "generator_large": {
+        "base_url": "http://127.0.0.1:8002/v1",
+        "served_model_name": "Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "api_key_env": null
+      }
+    },
+    "gpu_roles": {
+      "generator_small": {
+        "visible_devices": "0",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 32768,
+        "max_num_seqs": 1
+      },
+      "generator_large": {
+        "visible_devices": "0",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 32768,
+        "max_num_seqs": 1
+      },
+      "decision_small": {
+        "visible_devices": "0",
+        "device": "cuda:0",
+        "dtype": "bfloat16",
+        "batch_size": 1,
+        "question_context_tokens": 32768
+      },
+      "decision_large": {
+        "visible_devices": "0",
+        "device": "cuda:0",
+        "dtype": "bfloat16",
+        "batch_size": 1,
+        "question_context_tokens": 32768
+      }
+    },
+    "gpu_mapping_note": "Sequential role loading by default; target operator sets GPU IDs and generator TP. Native D3 is single-device BF16."
+  },
+  "target_validation_requirements": [
+    "target_hardware_and_resource_budget_to_record",
+    "validate_both_generators_native_thinking_and_action_protocol_in_debug_only_on_target_device"
+  ]
+}

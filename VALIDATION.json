@@ -1,0 +1,30 @@
+{
+  "recorded_at_utc": "2026-10-27T03:16:05.612290+00:00",
+  "validation": "37 stdlib unittest cases passed; all GPU/model/Docker/harness operations mocked",
+  "test_count": 37,
+  "real_gpu_tested": false,
+  "weights_downloaded": false,
+  "real_experiments_run": false,
+  "example_execution_enabled": false,
+  "source_hashes": {
+    "__init__.py": "cc9fa46c6d0ddb4b589930f9344d001ac071ea129524d81adc66a086ba11ddee",
+    "__main__.py": "3129adff95e0f38b87ab34cddfc27082c7892bcaec267ff5d40f160fdf55b44a",
+    "backends.py": "39be619274ab3519eec091058ba56766907ced2451bd14550031db45dea62565",
+    "cli.py": "49b2d2972c9a6c60debd8843ceca650db1da645258b45050b7767d0bba7b77c6",
+    "core.py": "ebcf4b15da8ca19350e71d8d4d6bae6b65d23daf25a52312847c19bbddd53e51",
+    "device.py": "afc11da0246207696b49ce1f95e71eda644a3df3172346ce41cd36da2c9b3a18",
+    "docker_env.py": "bf62eb3a51efdfd0833f9067cff050007aa46d74956b837c31f9595b705236ba",
+    "prompts\\actor.txt": "e8bfe87f011e17d6829241c9418b65c055b82d298a9dad787432d2875de8c0e9",
+    "prompts\\selector.txt": "713d52d9ec675e6525acb41eb3ce0c30f432332a46a3609705654fb23e83f930",
+    "reports.py": "fb43c5e48b758a85536b100052f0343b9f565ce8eb1e662baf4964bf33557c81",
+    "workflow.py": "a1290fa01602ac4f43697f932e581171bf5e7c5cdc52dfe5be7e3eb510edb198"
+  },
+  "additional_checks": [
+    "Python AST parsing",
+    "CLI validate-config",
+    "Best-of-3-only configuration validation",
+    "Local Markdown link targets",
+    "Model provenance checksums",
+    "Secret pattern scan of publishable text files"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "checked_date": "2026-10-24",
+  "validation": "PASS",
+  "inference_or_training_run": false,
+  "evidence_level": "author_declared_parent_repo_not_independently_verified_exact_training_initialization_commit",
+  "files": {
+    "d3-flash-main.json": "3290d5fc2bd5707aecc0845458c17720b991c773951ca67dd66fd4442d385e56",
+    "d3-flash-v3.1.0-README.md": "4b35f38aebbd3025cfeb385020e1fe0c8f667144c2c71a00a0ce9ea18ece0aad",
+    "d3-flash-v3.1.0.json": "129ab0f1780cbd9f07aa00ec60134495508f9bcb1df9ad616accf909b09f24e4",
+    "d3-v3.1.0-README.md": "62c45b5b40c4236aa52b65fb7c83da623c35edab4df7469f104c1597c4235d58",
+    "d3-v3.1.0.json": "f962b6d467f6ef936ad9a66c2fce60d2a24a00567c1cccc75f26ffb6b7a3cab4",
+    "qwen35-9b-main.json": "2f1df097f97fd0d0ccde90508274c18c9a2651d97ee8fe594b478c04870c8c50",
+    "qwen38-27b-main.json": "bdb933abab2ca0ff2498133481df849ba71e27cd19e77f4e62134457495a1150"
+  }
+}
