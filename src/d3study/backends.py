@@ -362,6 +362,191 @@ class VLLMGenerator:
         }
 
 
+class OllamaGenerator:
+    """Loopback Ollama client for one named Qwen generator.
+
+    Ollama has no separate tokenize route in the pinned 0.40 server. Prompt
+    size is the server's ``prompt_eval_count`` from a one-token preflight that
+    uses the same ``think`` setting as generation. Recorded usage still comes
+    from the real generation response.
+    """
+
+    def __init__(self, model: dict, service: dict, session: Any = None):
+        if not isinstance(model, Mapping) or not isinstance(service, Mapping):
+            raise BackendError("Model and service config must be objects")
+        self.model = copy.deepcopy(dict(model))
+        self.service = copy.deepcopy(dict(service))
+        name = self.model.get("ollama_model")
+        if not isinstance(name, str) or not name.strip() or any(c.isspace() for c in name):
+            raise BackendError("Ollama generator requires ollama_model")
+        self.model_name = name
+        template_kwargs = self.model.get("chat_template_kwargs")
+        if self.model.get("thinking") is not True or not isinstance(template_kwargs, Mapping) or template_kwargs.get("enable_thinking") is not True:
+            raise BackendError("Generator config must explicitly enable native thinking")
+        base_url = self.service.get("base_url")
+        if not isinstance(base_url, str):
+            raise BackendError("Ollama base_url must be a loopback origin")
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme not in ("http", "https")
+            or parsed.hostname not in ("127.0.0.1", "localhost")
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise BackendError("Ollama base_url must be a loopback origin without a path")
+        self.origin = f"{parsed.scheme}://{parsed.netloc}"
+        self.num_ctx = _positive_int(self.service.get("num_ctx"), "num_ctx")
+        self._session = session
+        self._verified = False
+
+    def _get_session(self) -> Any:
+        if self._session is None:
+            try:
+                requests = importlib.import_module("requests")
+                self._session = requests.Session()
+            except Exception:
+                raise BackendError("The HTTP client dependency is unavailable") from None
+        return self._session
+
+    def _request_json(self, method: str, path: str, *, timeout: Any, payload: Any = None) -> dict[str, Any]:
+        timeout_value = _validate_timeout(timeout)
+        url = f"{self.origin}/{path.lstrip('/')}"
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        try:
+            if method == "GET":
+                response = self._get_session().get(url, headers=headers, timeout=timeout_value, allow_redirects=False)
+            else:
+                response = self._get_session().post(url, headers=headers, json=payload, timeout=timeout_value, allow_redirects=False)
+        except BackendError:
+            raise
+        except Exception:
+            raise BackendError("Model service request failed") from None
+        status = getattr(response, "status_code", None)
+        if not isinstance(status, int) or not 200 <= status < 300:
+            label = f"HTTP {status}" if isinstance(status, int) else "an invalid HTTP status"
+            raise BackendError(f"Model service returned {label}")
+        try:
+            body = response.json()
+        except Exception:
+            raise BackendError("Model service returned invalid JSON") from None
+        if not isinstance(body, dict):
+            raise BackendError("Model service returned an unsupported response")
+        return body
+
+    def _messages(self, messages: Any) -> list:
+        safe_messages = _json_copy(messages, "messages")
+        if not isinstance(safe_messages, list) or not safe_messages or any(not isinstance(item, dict) for item in safe_messages):
+            raise BackendError("messages must be a non-empty list of objects")
+        return safe_messages
+
+    def _options(self, *, seed: int | None = None, max_new_tokens: int | None = None) -> dict[str, Any]:
+        options: dict[str, Any] = {"num_ctx": self.num_ctx}
+        for key in _SAMPLING_KEYS:
+            if key not in self.model:
+                continue
+            value = self.model[key]
+            target = "repeat_penalty" if key == "repetition_penalty" else key
+            if key == "top_k":
+                options[target] = _positive_int(value, key, allow_zero=True)
+            else:
+                number = _finite_number(value, key, minimum=0 if key == "temperature" else None)
+                if key in ("top_p", "min_p") and not 0 <= number <= 1:
+                    raise BackendError(f"{key} is outside the supported range")
+                if key == "repetition_penalty" and number <= 0:
+                    raise BackendError("repetition_penalty must be positive")
+                options[target] = number
+        if seed is not None:
+            options["seed"] = _positive_int(seed, "seed", allow_zero=True)
+        if max_new_tokens is not None:
+            options["num_predict"] = _positive_int(max_new_tokens, "max_new_tokens")
+        return options
+
+    def verify(self, timeout: float = 30) -> dict[str, Any]:
+        """Require the configured Ollama tag to be installed on this server."""
+        self._verified = False
+        response = self._request_json("GET", "api/tags", timeout=timeout)
+        models = response.get("models")
+        if not isinstance(models, list):
+            raise BackendError("Ollama did not return an installed-model list")
+        names = [item.get("name") for item in models if isinstance(item, dict)]
+        if self.model_name not in names:
+            raise BackendError("Ollama model identity does not match the configured tag")
+        self._verified = True
+        return {"model": self.model_name, "verified": True}
+
+    def _require_verified(self) -> None:
+        if not self._verified:
+            raise BackendError("Call verify() successfully before using the model service")
+
+    def _chat(self, messages: list, *, seed: int | None, max_new_tokens: int, timeout: Any) -> dict[str, Any]:
+        payload = {
+            "model": self.model_name,
+            "messages": self._messages(messages),
+            "stream": False,
+            "think": True,
+            "options": self._options(seed=seed, max_new_tokens=max_new_tokens),
+        }
+        return self._request_json("POST", "api/chat", timeout=timeout, payload=payload)
+
+    @staticmethod
+    def _count(response: Mapping[str, Any], key: str) -> int:
+        value = response.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BackendError("Ollama returned an unverifiable token count")
+        return value
+
+    def count_tokens(self, messages: list, timeout: float = 30) -> int:
+        """Count the rendered prompt with the same think setting as generation."""
+        self._require_verified()
+        response = self._chat(messages, seed=None, max_new_tokens=1, timeout=timeout)
+        if response.get("model") != self.model_name:
+            raise BackendError("Ollama token-count identity does not match the configured tag")
+        return self._count(response, "prompt_eval_count")
+
+    def generate(self, messages: list, seed: int, max_new_tokens: int, timeout: float) -> dict[str, Any]:
+        """Generate one response and keep Ollama thinking separate from final text."""
+        self._require_verified()
+        started = time.perf_counter()
+        response = self._chat(messages, seed=seed, max_new_tokens=max_new_tokens, timeout=timeout)
+        seconds = time.perf_counter() - started
+        if response.get("model") != self.model_name:
+            raise BackendError("Generation response identity does not match the configured tag")
+        message = response.get("message")
+        if not isinstance(message, dict):
+            raise BackendError("Ollama returned an unsupported completion message")
+        tool_calls = message.get("tool_calls")
+        if tool_calls not in (None, []):
+            raise BackendError("Tool calls are unsupported by the generator adapter")
+        finish_reason = response.get("done_reason")
+        if not isinstance(finish_reason, str) or not finish_reason:
+            raise BackendError("Ollama returned no valid finish reason")
+        content = message.get("content")
+        if content is None and finish_reason == "length":
+            content = ""
+        if not isinstance(content, str) or (not content.strip() and finish_reason != "length"):
+            raise BackendError("Ollama returned no final content")
+        if _THINK_RE.search(content):
+            raise BackendError("Final content contains unparsed native thinking markers")
+        reasoning = message.get("thinking")
+        if reasoning is None:
+            reasoning = message.get("reasoning")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise BackendError("Ollama returned invalid reasoning content")
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "input_tokens": self._count(response, "prompt_eval_count"),
+            "output_tokens": self._count(response, "eval_count"),
+            "reasoning_tokens": None,
+            "finish_reason": finish_reason,
+            "raw_response": response,
+            "seconds": seconds,
+        }
+
+
 def _linux_snapshot_path(snapshot_path: str) -> str:
     if not isinstance(snapshot_path, str) or not snapshot_path or "\\" in snapshot_path:
         raise BackendError("snapshot_path must be an absolute Linux path")

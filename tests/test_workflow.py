@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,15 +97,32 @@ class WorkflowTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main(['--config', str(ROOT/'configs/gpu.example.json'), 'validate-config']), 0)
 
-    def test_server_uses_executable_in_its_own_environment(self):
+    def test_server_uses_configured_ollama_executable(self):
         from d3study.cli import serve
-        revision=self.cfg['models']['generator_small']['revision']
-        hub=SimpleNamespace(snapshot_download=lambda **kwargs:'/cache/snapshots/'+revision)
         process=SimpleNamespace(pid=123,wait=lambda:0,poll=lambda:0)
-        with patch('d3study.cli.require_linux'), patch('d3study.device.cuda_inventory',return_value={'devices':[{}]}), patch.dict('sys.modules',{'huggingface_hub':hub}), patch('d3study.cli.shutil.which',return_value='/generator-venv/bin/vllm'), patch('d3study.cli.subprocess.Popen',return_value=process) as launch:
-            serve(self.cfg,self.workspace,'generator_small')
-        self.assertEqual(launch.call_args.args[0][0],'/generator-venv/bin/vllm')
-        self.assertEqual(read_json(self.workspace/'services/generator_small/deployment.json')['server_pid'],123)
+        self.cfg['runtime']['ollama']['cuda_compat_dir']='/opt/cuda-compat'
+        seen={}
+        def inventory(strict=False):
+            seen['ld']=os.environ.get('LD_LIBRARY_PATH','')
+            return {'devices':[{}]}
+        previous=os.environ.get('LD_LIBRARY_PATH')
+        try:
+            with patch('d3study.cli.require_linux'), patch('d3study.device.cuda_inventory',inventory), patch('d3study.cli.subprocess.Popen',return_value=process) as launch:
+                serve(self.cfg,self.workspace,'generator_small')
+        finally:
+            if previous is None:
+                os.environ.pop('LD_LIBRARY_PATH', None)
+            else:
+                os.environ['LD_LIBRARY_PATH']=previous
+        self.assertEqual(launch.call_args.args[0],['/opt/ollama/bin/ollama','serve'])
+        self.assertEqual(launch.call_args.kwargs['env']['OLLAMA_MODELS'],'/opt/ollama/models')
+        self.assertEqual(launch.call_args.kwargs['env']['OLLAMA_CONTEXT_LENGTH'],'262144')
+        expected='/opt/cuda-compat'+os.pathsep+'/opt/ollama/lib/ollama'
+        self.assertTrue(seen['ld']==expected or seen['ld'].startswith(expected+os.pathsep))
+        self.assertEqual(launch.call_args.kwargs['env']['LD_LIBRARY_PATH'], seen['ld'])
+        deployment=read_json(self.workspace/'services/generator_small/deployment.json')
+        self.assertEqual(deployment['server_pid'],123)
+        self.assertEqual(deployment['ollama_model'],'qwen3.5:2b')
 
     def test_generation_rejects_unmanaged_endpoint_before_calls(self):
         with patch('d3study.workflow.require_linux'), self.assertRaises(StudyError):

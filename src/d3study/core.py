@@ -14,6 +14,23 @@ from pathlib import Path
 
 GENERATORS = ("generator_small", "generator_large")
 SELECTORS = ("decision_small", "decision_large")
+
+
+def active_generators(cfg):
+    return _active_roles(cfg, "active_generators", GENERATORS)
+
+
+def active_selectors(cfg):
+    return _active_roles(cfg, "active_selectors", SELECTORS)
+
+
+def _active_roles(cfg, key, allowed):
+    chosen = cfg.get("runtime", {}).get(key)
+    if not chosen:
+        return allowed
+    if not isinstance(chosen, list) or not chosen or any(name not in allowed for name in chosen):
+        raise StudyError(f"{key} must list known roles")
+    return tuple(chosen)
 COMPLETE = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 
@@ -77,6 +94,15 @@ def seed_for(*parts):
     return int(hashlib.sha256(canonical(parts).encode()).hexdigest()[:8], 16) % (2**31)
 
 
+def prepend_library_path(paths):
+    """Put configured CUDA libraries ahead of the inherited linker path."""
+    prefix = [path for path in paths if isinstance(path, str) and path]
+    if not prefix:
+        return
+    inherited = os.environ.get("LD_LIBRARY_PATH")
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([*prefix, *([inherited] if inherited else [])])
+
+
 def clip(text, limit):
     if len(text) <= limit:
         return text
@@ -93,7 +119,11 @@ def load_config(path):
         raise StudyError("This runner does not train or fine-tune models")
     for role in (*GENERATORS, *SELECTORS):
         model = cfg.get("models", {}).get(role, {})
-        if not isinstance(model.get("repo"), str) or not re.fullmatch(r"[0-9a-f]{40}", model.get("revision", "")):
+        if role in GENERATORS and model.get("backend") == "ollama":
+            name = model.get("ollama_model")
+            if not isinstance(name, str) or not name.strip() or any(c.isspace() for c in name):
+                raise StudyError(f"{role} needs an Ollama model tag")
+        elif not isinstance(model.get("repo"), str) or not re.fullmatch(r"[0-9a-f]{40}", model.get("revision", "")):
             raise StudyError(f"{role} needs a repo and full pinned revision")
         if role in GENERATORS and (model.get("thinking") is not True or model.get("chat_template_kwargs", {}).get("enable_thinking") is not True):
             raise StudyError(f"{role} must explicitly enable native thinking")
@@ -107,8 +137,8 @@ def load_config(path):
     for key in ("decision_steps", "command_timeout_seconds", "active_rollout_timeout_seconds", "model_request_timeout_seconds", "max_new_tokens_per_action", "generator_max_context_tokens", "max_total_generated_tokens_per_rollout"):
         if isinstance(limits.get(key), bool) or not isinstance(limits.get(key), int) or limits[key] <= 0:
             raise StudyError(f"Invalid positive limit: {key}")
-    if limits["max_new_tokens_per_action"] >= limits["generator_max_context_tokens"]:
-        raise StudyError("Context needs space for input in addition to output")
+    if limits["max_new_tokens_per_action"] > limits["generator_max_context_tokens"]:
+        raise StudyError("A reply cannot request more tokens than the model context")
     for role in (*GENERATORS, *SELECTORS):
         if role not in runtime.get("gpu_roles", {}):
             raise StudyError(f"GPU role mapping missing: {role}")
@@ -118,7 +148,15 @@ def load_config(path):
         if role in GENERATORS:
             if gpu.get("max_model_len") != limits["generator_max_context_tokens"]:
                 raise StudyError("Generator service context must equal the frozen rollout context")
-            if gpu.get("tensor_parallel_size", 0) < 1:
+            model = cfg["models"][role]
+            if model.get("backend") == "ollama":
+                service = runtime.get("generator_services", {}).get(role, {})
+                if service.get("num_ctx") != limits["generator_max_context_tokens"]:
+                    raise StudyError("Ollama num_ctx must equal the generator context budget")
+                ollama = runtime.get("ollama")
+                if not isinstance(ollama, dict) or not isinstance(ollama.get("executable"), str) or not isinstance(ollama.get("models_dir"), str):
+                    raise StudyError("Ollama runtime needs an executable and models_dir")
+            elif gpu.get("tensor_parallel_size", 0) < 1:
                 raise StudyError("Generator tensor parallel size must be positive")
         elif gpu.get("question_context_tokens") != cfg["decision_input"]["common_question_context_budget_tokens"]:
             raise StudyError("Both selectors must use the common decision context budget")
@@ -141,7 +179,11 @@ def managed_service(cfg, workspace, role):
             raise ValueError()
         if state.get("state") != "running" or state.get("pid") != deployment["controller_pid"] or state.get("boot_id") != boot or time.time()-state["heartbeat_unix"] >= 30:
             raise ValueError()
-        if Path(deployment["snapshot"]).name != cfg["models"][role]["revision"]:
+        model = cfg["models"][role]
+        if model.get("backend") == "ollama":
+            if deployment.get("ollama_model") != model.get("ollama_model"):
+                raise ValueError()
+        elif Path(deployment["snapshot"]).name != model["revision"]:
             raise ValueError()
         os.kill(deployment["server_pid"], 0)
         os.kill(deployment["controller_pid"], 0)

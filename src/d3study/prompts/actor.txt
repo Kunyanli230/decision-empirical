@@ -10,9 +10,17 @@ commit changes. Temporary reproduction scripts may be placed under /tmp.
 Each action starts in /testbed in a new shell. Files persist; shell variables
 and working-directory changes do not persist between actions.
 
-When ready, submit this exact action in its own bash block:
-echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-The controller will collect the final diff relative to the task base commit.
+Stop reasoning once the next command is clear. Do not repeat the same analysis.
+A reply that only thinks is not executed. Final content must be one fence
+and nothing else, in this shape:
+
+```bash
+sed -n '1,80p' path/to/source.py
+```
+
+Do not submit on the first action. After the source fix is in the worktree,
+the one fence contains only echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT.
+The controller collects the final diff relative to the task base commit.
 
 ISSUE:
 {{ problem_statement }}

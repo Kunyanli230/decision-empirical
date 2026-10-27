@@ -14,7 +14,7 @@
     "core.py": "ebcf4b15da8ca19350e71d8d4d6bae6b65d23daf25a52312847c19bbddd53e51",
     "device.py": "afc11da0246207696b49ce1f95e71eda644a3df3172346ce41cd36da2c9b3a18",
     "docker_env.py": "bf62eb3a51efdfd0833f9067cff050007aa46d74956b837c31f9595b705236ba",
-    "prompts\\actor.txt": "e8bfe87f011e17d6829241c9418b65c055b82d298a9dad787432d2875de8c0e9",
+    "prompts\\actor.txt": "ea28a2cb15b3a8c55f07280211b3994ade8253f3b04917a83b3965e2f7e238dd",
     "prompts\\selector.txt": "713d52d9ec675e6525acb41eb3ce0c30f432332a46a3609705654fb23e83f930",
     "reports.py": "fb43c5e48b758a85536b100052f0343b9f565ce8eb1e662baf4964bf33557c81",
     "workflow.py": "a1290fa01602ac4f43697f932e581171bf5e7c5cdc52dfe5be7e3eb510edb198"
