@@ -8,11 +8,12 @@ import re
 import time
 from pathlib import Path, PurePosixPath
 
-from .backends import BackendError, NativeD3Selector, VLLMGenerator
-from .core import (COMPLETE, GENERATORS, SELECTORS, Heartbeat, StudyError, atomic_json,
+from .backends import BackendError, NativeD3Selector, OllamaGenerator, VLLMGenerator
+from .core import (COMPLETE, GENERATORS, SELECTORS, Heartbeat, StudyError, active_generators, active_selectors, atomic_json,
                    canonical, clip, data_spec, digest, event, file_digest, freeze_run, parse_action,
-                   managed_service, read_json, require_execution, require_linux, run_lock, safe_id, seed_for)
-from .docker_env import DockerSession, docker, inspect_image
+                   managed_service, prepend_library_path, read_json, require_execution, require_linux, run_lock, safe_id, seed_for)
+from .docker_env import DockerSession, EnrootSession, docker, enroot_import, file_sha256, inspect_image
+from .step_dedup import should_verify
 
 
 def _write_dataset(cfg, workspace, stage, rows, verified_ids, source):
@@ -93,7 +94,10 @@ def prepare_images(cfg, workspace, stage):
     target = workspace / "data" / stage
     rows = read_json(target / "public.json")
     path = target / "images.json"
-    exe = cfg["runtime"]["docker"].get("executable", "docker")
+    settings = cfg["runtime"]["docker"]
+    if settings.get("runtime") == "enroot":
+        return _prepare_enroot_images(cfg, target, rows, path, settings)
+    exe = settings.get("executable", "docker")
     if path.exists():
         frozen = read_json(path)
         for info in frozen.values():
@@ -111,6 +115,25 @@ def prepare_images(cfg, workspace, stage):
     return images
 
 
+def _prepare_enroot_images(cfg, target, rows, path, settings):
+    if path.exists():
+        frozen = read_json(path)
+        for info in frozen.values():
+            sqsh = Path(info["sqsh"])
+            if not sqsh.is_file() or file_sha256(sqsh) != info["id"]:
+                raise StudyError("A frozen container image changed")
+        return frozen
+    images = {}
+    for row in rows:
+        output = Path(settings["enroot_data"]) / f"{safe_id(row['instance_id'])}.sqsh"
+        import_settings = dict(settings)
+        import_settings["image_pull_timeout_seconds"] = cfg["runtime"].get("image_pull_timeout_seconds", 3600)
+        images[row["instance_id"]] = enroot_import(import_settings, row["image_tag"], output)
+        atomic_json(target / "image-pull-progress.json", images)
+    atomic_json(path, images)
+    return images
+
+
 def forbidden_paths(paths):
     result = []
     for path in paths:
@@ -120,14 +143,20 @@ def forbidden_paths(paths):
     return result
 
 
-def _fit_history(backend, messages, output_budget, context_limit, deadline):
+def _fit_history(backend, messages, context_limit, deadline):
+    """Keep every completed turn that fits in the native context.
+
+    There is no per-reply token cap. The caller gives the model whatever room
+    remains after this prompt. Oldest assistant/observation pairs are removed
+    only when the prompt itself does not fit.
+    """
     messages = copy.deepcopy(messages)
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
             raise StudyError("wall_time_limit")
         count = backend.count_tokens(messages, timeout=min(30, left))
-        if count + output_budget <= context_limit:
+        if count < context_limit:
             return messages, count
         if len(messages) <= 1:
             raise StudyError("task_exceeds_context_budget")
@@ -151,18 +180,17 @@ def generate_attempt(cfg, row, role, index, image, directory, backend, env_facto
     errors, interrupted = 0, False
     atomic_json(directory / "started.json", {"instance_id": row["instance_id"], "generator": role, "candidate_index": index, "time_unix": time.time(), "image": image})
     try:
-        env = env_factory(image["id"], row["base_commit"], cfg["runtime"]["docker"], ttl=limits["active_rollout_timeout_seconds"] + 180)
+        image_ref = image.get("sqsh") if cfg["runtime"]["docker"].get("runtime") == "enroot" else image["id"]
+        env = env_factory(image_ref, row["base_commit"], cfg["runtime"]["docker"], ttl=limits["active_rollout_timeout_seconds"] + 180)
         for step in range(limits["decision_steps"]):
             left = deadline - time.monotonic()
             if left <= 0:
                 reason = "wall_time_limit"
                 break
-            remaining_tokens = limits["max_total_generated_tokens_per_rollout"] - stats["output_tokens"]
-            if remaining_tokens <= 0:
-                reason = "output_token_limit"
-                break
-            allowance = min(remaining_tokens, limits["max_new_tokens_per_action"])
-            messages, input_count = _fit_history(backend, messages, allowance, limits["generator_max_context_tokens"], deadline)
+            messages, input_count = _fit_history(backend, messages, limits["generator_max_context_tokens"], deadline)
+            allowance = limits["generator_max_context_tokens"] - input_count
+            if allowance <= 0:
+                raise StudyError("task_exceeds_context_budget")
             seed = seed_for(cfg["candidate_pool"]["study_seed"], row["instance_id"], role, index, step)
             event(events, {"type": "model_reservation", "step": step, "input_tokens_counted": input_count, "output_tokens_upper_bound": allowance, "seed": seed})
             stats["model_calls"] += 1
@@ -176,9 +204,15 @@ def generate_attempt(cfg, row, role, index, image, directory, backend, env_facto
             if time.monotonic() >= deadline:
                 reason = "wall_time_limit"
                 break
-            if result["finish_reason"] == "length":
-                reason = "generation_truncated_before_action"
-                break
+            content = result["content"] or ""
+            if result["finish_reason"] in ("length", "repetition") and not content.strip():
+                errors += 1
+                stats["format_errors"] += 1
+                messages += [{"role": "assistant", "content": ""}, {"role": "user", "content": "NO_ACTION: That reply was not executed. It filled the remaining context or repeated itself without a final command. Return exactly one complete bash fenced block in final content, with no surrounding prose. Do not repeat the same sentence."}]
+                if errors >= limits.get("max_consecutive_format_errors", 3):
+                    reason = "generation_truncated_before_action"
+                    break
+                continue
             content = result["content"]
             assistant = {"role": "assistant", "content": content}
             if model.get("chat_template_kwargs", {}).get("preserve_thinking") and result.get("reasoning"):
@@ -218,8 +252,8 @@ def generate_attempt(cfg, row, role, index, image, directory, backend, env_facto
             finally:
                 try:
                     env.close()
-                except Exception:
-                    event(events, {"type": "cleanup_error"})
+                except Exception as error:
+                    event(events, {"type": "cleanup_error", "reason": str(error)})
         invalid = forbidden_paths(paths)
         result = {"instance_id": row["instance_id"], "generator": role, "candidate_index": index, "termination_reason": reason,
                   "model_patch": patch, "patch_sha256": hashlib.sha256(patch.encode()).hexdigest(), "changed_paths": paths,
@@ -244,14 +278,24 @@ def load_candidate(run, role, iid, index):
     return result
 
 
-def generate(cfg, workspace, stage, role, backend=None, env_factory=DockerSession):
+def _generator_backend(cfg, role):
+    model = cfg["models"][role]
+    service = cfg["runtime"]["generator_services"][role]
+    if model.get("backend") == "ollama":
+        return OllamaGenerator(model, service)
+    return VLLMGenerator(model, service)
+
+
+def generate(cfg, workspace, stage, role, backend=None, env_factory=None):
     require_execution(cfg)
     require_linux()
     run = freeze_run(cfg, workspace, stage)
     rows = read_json(workspace / "data" / stage / "public.json")
     images = read_json(workspace / "data" / stage / "images.json")
     deployment = managed_service(cfg, workspace, role) if backend is None else {"verification": "injected test backend"}
-    backend = backend or VLLMGenerator(cfg["models"][role], cfg["runtime"]["generator_services"][role])
+    backend = backend or _generator_backend(cfg, role)
+    if env_factory is None:
+        env_factory = EnrootSession if cfg["runtime"]["docker"].get("runtime") == "enroot" else DockerSession
     with run_lock(run / ".phase.lock"), Heartbeat(run, "generate", generator=role) as heartbeat:
         identity = backend.verify()
         atomic_json(run / f"service-{role}.json", {"endpoint": identity, **deployment})
@@ -320,46 +364,54 @@ def select(cfg, workspace, stage, role, selector=None):
     run = freeze_run(cfg, workspace, stage)
     rows = read_json(workspace / "data" / stage / "public.json")
     n = cfg["candidate_pool"]["main_n"]
-    for gen in GENERATORS:
+    generators = active_generators(cfg)
+    for gen in generators:
         for row in rows:
             _pool(run, gen, row["instance_id"], n)
     instructions = (Path(__file__).parent / "prompts/selector.txt").read_text(encoding="utf-8")
     gpu = cfg["runtime"]["gpu_roles"][role]
+    # Native D3 uses the same CUDA forward-compat libraries recorded for this host.
+    prepend_library_path([(cfg["runtime"].get("ollama") or {}).get("cuda_compat_dir")])
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu["visible_devices"]
     selector = selector or NativeD3Selector(cfg["models"][role], gpu, cfg["runtime"].get("hf_cache_dir"))
+    pending = []
+    for gen in generators:
+        for row in rows:
+            pool = _pool(run, gen, row["instance_id"], n)
+            unique = len({(item["patch_sha256"], item["protocol_status"]) for item in pool})
+            pending.append((gen, row, pool, unique))
     with run_lock(run / ".phase.lock"), Heartbeat(run, "select", selector=role):
         try:
-            atomic_json(run / f"loaded-{role}.json", selector.load())
-            for gen in GENERATORS:
-                for row in rows:
-                    iid = row["instance_id"]
-                    pool = _pool(run, gen, iid, n)
-                    path = run / "decisions" / role / gen / f"{iid}.json"
-                    pool_hash = digest(pool)
-                    if path.exists():
-                        if read_json(path)["pool_sha256"] != pool_hash:
-                            raise StudyError("Candidate pool changed after a decision")
-                        continue
-                    indices = list(range(n))
-                    random.Random(seed_for("presentation", cfg["candidate_pool"]["study_seed"], gen, iid)).shuffle(indices)
-                    mapping = {f"option_{j+1}": i for j, i in enumerate(indices)}
-                    criteria = {label: {"diff": pool[i]["model_patch"], "changed_paths": pool[i]["changed_paths"], "protocol_status": pool[i]["protocol_status"], "termination_reason": pool[i]["termination_reason"], "observed_checks": _evidence(run, gen, iid, i, cfg["decision_input"]["observed_output_excerpt_chars_per_candidate"])} for label, i in mapping.items()}
-                    state = {"issue": row["problem_statement"], "repository": row["repo"], "evidence_policy": "Only recorded command results are observations. Official evaluation labels are unavailable."}
-                    selected, status, response, failure, choice_seconds = None, "decision_failure", None, None, 0.0
-                    if len({(p["patch_sha256"], p["protocol_status"]) for p in pool}) == 1:
-                        selected, status = 0, "identical_pool"
-                    else:
-                        try:
-                            choice_started = time.monotonic()
-                            response = selector.choose(state, criteria, instructions)
-                            selected, status = mapping[response["choice"]], "selected"
-                        except (BackendError, KeyError) as error:
-                            failure = {"category": "context_error" if "context" in str(error).lower() else "native_backend_error", "reason": str(error), "details": getattr(error, "details", None)}
-                        finally:
-                            choice_seconds = time.monotonic() - choice_started
-                    result = {"instance_id": iid, "generator": gen, "selector": role, "pool_sha256": pool_hash, "display_to_candidate": mapping, "selected_index": selected, "status": status, "selected_patch_sha256": pool[selected]["patch_sha256"] if selected is not None else None, "request": {"state": state, "criteria": criteria, "instructions": instructions}, "response": response, "failure": failure, "choice_wall_seconds": choice_seconds}
-                    atomic_json(path, result)
-                    print(canonical({"event": "decision_complete", "selector": role, "generator": gen, "instance_id": iid, "status": status}), flush=True)
+            if any(should_verify(unique) for _, _, _, unique in pending):
+                atomic_json(run / f"loaded-{role}.json", selector.load())
+            for gen, row, pool, unique in pending:
+                iid = row["instance_id"]
+                path = run / "decisions" / role / gen / f"{iid}.json"
+                pool_hash = digest(pool)
+                if path.exists():
+                    if read_json(path)["pool_sha256"] != pool_hash:
+                        raise StudyError("Candidate pool changed after a decision")
+                    continue
+                indices = list(range(n))
+                random.Random(seed_for("presentation", cfg["candidate_pool"]["study_seed"], gen, iid)).shuffle(indices)
+                mapping = {f"option_{j+1}": i for j, i in enumerate(indices)}
+                criteria = {label: {"diff": pool[i]["model_patch"], "changed_paths": pool[i]["changed_paths"], "protocol_status": pool[i]["protocol_status"], "termination_reason": pool[i]["termination_reason"], "observed_checks": _evidence(run, gen, iid, i, cfg["decision_input"]["observed_output_excerpt_chars_per_candidate"])} for label, i in mapping.items()}
+                state = {"issue": row["problem_statement"], "repository": row["repo"], "evidence_policy": "Only recorded command results are observations. Official evaluation labels are unavailable."}
+                selected, status, response, failure, choice_seconds = None, "decision_failure", None, None, 0.0
+                if not should_verify(unique):
+                    selected, status = 0, "identical_pool"
+                else:
+                    try:
+                        choice_started = time.monotonic()
+                        response = selector.choose(state, criteria, instructions)
+                        selected, status = mapping[response["choice"]], "selected"
+                    except (BackendError, KeyError) as error:
+                        failure = {"category": "context_error" if "context" in str(error).lower() else "native_backend_error", "reason": str(error), "details": getattr(error, "details", None)}
+                    finally:
+                        choice_seconds = time.monotonic() - choice_started
+                result = {"instance_id": iid, "generator": gen, "selector": role, "pool_sha256": pool_hash, "unique_candidates": unique, "verification": "compared" if should_verify(unique) else "skipped_fewer_than_two_unique", "display_to_candidate": mapping, "selected_index": selected, "status": status, "selected_patch_sha256": pool[selected]["patch_sha256"] if selected is not None else None, "request": {"state": state, "criteria": criteria, "instructions": instructions}, "response": response, "failure": failure, "choice_wall_seconds": choice_seconds}
+                atomic_json(path, result)
+                print(canonical({"event": "decision_complete", "selector": role, "generator": gen, "instance_id": iid, "status": status}), flush=True)
         finally:
             selector.close()
     return {"run": str(run), "selector": role}
@@ -369,13 +421,13 @@ def check_decisions(cfg, workspace, stage):
     run = workspace / "runs" / stage
     rows = read_json(workspace / "data" / stage / "public.json")
     n = cfg["candidate_pool"]["main_n"]
-    for judge in SELECTORS:
-        for gen in GENERATORS:
+    for judge in active_selectors(cfg):
+        for gen in active_generators(cfg):
             for row in rows:
                 pool = _pool(run, gen, row["instance_id"], n)
                 path = run / "decisions" / judge / gen / f"{row['instance_id']}.json"
                 if not path.exists():
-                    raise StudyError("Seal both selectors' decisions for both pools before official evaluation")
+                    raise StudyError("Seal the active selectors' decisions before official evaluation")
                 decision = read_json(path)
                 index = decision["selected_index"]
                 if decision["pool_sha256"] != digest(pool) or (index is not None and (index not in range(n) or decision["selected_patch_sha256"] != pool[index]["patch_sha256"])):

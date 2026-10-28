@@ -13,11 +13,81 @@ from urllib.parse import urlsplit
 
 from .backends import BackendError, build_vllm_command
 from .core import (GENERATORS, SELECTORS, Heartbeat, StudyError, atomic_json, canonical,
-                   digest, load_config, read_json, require_execution, require_linux, run_lock)
+                   digest, load_config, prepend_library_path, read_json, require_execution, require_linux, run_lock)
+
+
+def _ollama_launch(cfg, role):
+    model = cfg["models"][role]
+    gpu = cfg["runtime"]["gpu_roles"][role]
+    service = cfg["runtime"]["generator_services"][role]
+    ollama = cfg["runtime"]["ollama"]
+    parsed = urlsplit(service["base_url"])
+    if parsed.hostname not in ("127.0.0.1", "localhost") or not parsed.port:
+        raise StudyError("Ollama must listen on a loopback port")
+    library = ollama.get("library_dir")
+    compat = ollama.get("cuda_compat_dir")
+    prefix = [path for path in (compat, library) if isinstance(path, str) and path]
+    return {
+        "command": [ollama["executable"], "serve"],
+        "env": {
+            "OLLAMA_HOST": f"{parsed.hostname}:{parsed.port}",
+            "OLLAMA_MODELS": ollama["models_dir"],
+            "OLLAMA_CONTEXT_LENGTH": str(gpu["max_model_len"]),
+            "CUDA_VISIBLE_DEVICES": gpu["visible_devices"],
+            "LD_LIBRARY_PATH_PREFIX": prefix,
+        },
+        "ollama_model": model["ollama_model"],
+    }
+
+
+def serve_ollama(cfg, workspace, role, print_command=False):
+    launch = _ollama_launch(cfg, role)
+    model = cfg["models"][role]
+    gpu = cfg["runtime"]["gpu_roles"][role]
+    service = cfg["runtime"]["generator_services"][role]
+    if print_command:
+        return {"command": launch["command"], "env": launch["env"], "executed": False}
+    require_execution(cfg)
+    require_linux()
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu["visible_devices"]
+    # The inventory uses this process's linker path. Apply the same prefix the
+    # server child receives, or a newer CUDA wheel cannot see an older driver.
+    prepend_library_path(launch["env"]["LD_LIBRARY_PATH_PREFIX"])
+    from .device import cuda_inventory
+    inventory = cuda_inventory(strict=True)
+    if not inventory["devices"]:
+        raise StudyError("Ollama did not see a visible GPU")
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu["visible_devices"]
+    env["OLLAMA_HOST"] = launch["env"]["OLLAMA_HOST"]
+    env["OLLAMA_MODELS"] = launch["env"]["OLLAMA_MODELS"]
+    env["OLLAMA_CONTEXT_LENGTH"] = launch["env"]["OLLAMA_CONTEXT_LENGTH"]
+    with run_lock(workspace / "services" / f"{role}.lock"):
+        directory = workspace / "services" / role
+        directory.mkdir(parents=True, exist_ok=True)
+        with Heartbeat(directory, "serve", generator=role) as heartbeat, (directory / "server.log").open("a", encoding="utf-8") as log:
+            process = subprocess.Popen(launch["command"], stdout=log, stderr=subprocess.STDOUT, env=env)
+            atomic_json(directory / "deployment.json", {"model": model, "gpu": gpu, "service": service, "snapshot": launch["env"]["OLLAMA_MODELS"], "ollama_model": launch["ollama_model"], "command": launch["command"], "server_pid": process.pid, "controller_pid": os.getpid(), "hostname": heartbeat.data["hostname"], "boot_id": heartbeat.data["boot_id"], "environment_credentials": "not recorded", "target_inventory": inventory})
+            try:
+                code = process.wait()
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            atomic_json(directory / "exit.json", {"exit_code": code})
+            if code:
+                raise StudyError("Ollama server exited with an error; inspect its server.log")
+    return {"service": role, "exit_code": code}
 
 
 def serve(cfg, workspace, role, print_command=False):
     model = cfg["models"][role]
+    if model.get("backend") == "ollama":
+        return serve_ollama(cfg, workspace, role, print_command)
     gpu = cfg["runtime"]["gpu_roles"][role]
     service = cfg["runtime"]["generator_services"][role]
     parsed = urlsplit(service["base_url"])

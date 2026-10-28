@@ -25,11 +25,12 @@
       "parent_initialization_revision": null
     },
     "generator_small": {
-      "repo": "Qwen/Qwen3.5-9B",
-      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
-      "checkpoint_type": "declared_direct_parent_of_decision_small_post_trained",
-      "interface": "official_chat_template",
-      "precision": "bfloat16",
+      "backend": "ollama",
+      "repo": "Qwen/Qwen3.5-2B",
+      "ollama_model": "qwen3.5:2b",
+      "checkpoint_type": "ollama_q8_substitute_not_declared_d3_flash_parent",
+      "interface": "ollama_chat_think",
+      "precision": "Q8_0",
       "thinking": true,
       "chat_template_kwargs": {
         "enable_thinking": true
@@ -102,21 +103,19 @@
     "decision_steps": 100,
     "max_consecutive_format_errors": 3,
     "command_timeout_seconds": 120,
-    "active_rollout_timeout_seconds": 3600,
-    "model_request_timeout_seconds": 600,
-    "max_new_tokens_per_action": 16384,
+    "active_rollout_timeout_seconds": 86400,
+    "model_request_timeout_seconds": 14400,
     "output_limit_includes_reasoning_and_final": true,
     "record_reasoning_and_final_separately": true,
     "parse_actions_from": "final_content_only_not_reasoning",
     "no_final_content_on_length_limit_status": "generation_truncated_before_action",
-    "generator_max_context_tokens": 32768,
-    "max_total_generated_tokens_per_rollout": 131072,
+    "generator_max_context_tokens": 262144,
     "transport_attempts": 2,
-    "note": "Debug and pilot both use complete trajectory Best-of-3. Freeze limits after target debug and before the 50-task pilot."
+    "note": "No per-reply or per-rollout token cap. A reply uses the native-context tokens left after the prompt. History is removed only when the prompt itself does not fit."
   },
   "decision_input": {
     "profile": "issue_complete_diff_recorded_evidence",
-    "common_question_context_budget_tokens": 32768,
+    "common_question_context_budget_tokens": 262144,
     "verify_both_model_actual_limits": true,
     "observed_output_excerpt_chars_per_candidate": 8000,
     "truncate_issue_or_diff": false,
@@ -182,10 +181,17 @@
       "max_workers": 1,
       "timeout_seconds": 1800
     },
+    "ollama": {
+      "executable": "/opt/ollama/bin/ollama",
+      "models_dir": "/opt/ollama/models",
+      "library_dir": "/opt/ollama/lib/ollama",
+      "cuda_compat_dir": null
+    },
     "generator_services": {
       "generator_small": {
-        "base_url": "http://127.0.0.1:8001/v1",
-        "served_model_name": "Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "base_url": "http://127.0.0.1:11434",
+        "ollama_model": "qwen3.5:2b",
+        "num_ctx": 262144,
         "api_key_env": null
       },
       "generator_large": {
@@ -199,14 +205,14 @@
         "visible_devices": "0",
         "tensor_parallel_size": 1,
         "gpu_memory_utilization": 0.9,
-        "max_model_len": 32768,
+        "max_model_len": 262144,
         "max_num_seqs": 1
       },
       "generator_large": {
         "visible_devices": "0",
         "tensor_parallel_size": 1,
         "gpu_memory_utilization": 0.9,
-        "max_model_len": 32768,
+        "max_model_len": 262144,
         "max_num_seqs": 1
       },
       "decision_small": {
@@ -214,14 +220,14 @@
         "device": "cuda:0",
         "dtype": "bfloat16",
         "batch_size": 1,
-        "question_context_tokens": 32768
+        "question_context_tokens": 262144
       },
       "decision_large": {
         "visible_devices": "0",
         "device": "cuda:0",
         "dtype": "bfloat16",
         "batch_size": 1,
-        "question_context_tokens": 32768
+        "question_context_tokens": 262144
       }
     },
     "gpu_mapping_note": "Sequential role loading by default; target operator sets GPU IDs and generator TP. Native D3 is single-device BF16."

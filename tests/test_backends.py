@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import types
 import unittest
@@ -211,6 +212,90 @@ class GeneratorTests(unittest.TestCase):
                 generator_config(chat_template_kwargs={"enable_thinking": False}),
                 {"base_url": "http://localhost:8000/v1"},
             )
+
+
+def ollama_chat(content="Run the focused test suite.", thinking="Inspect the failing branch first.", done_reason="stop"):
+    return {
+        "model": "qwen3.5:2b",
+        "message": {"role": "assistant", "content": content, "thinking": thinking},
+        "done": True,
+        "done_reason": done_reason,
+        "prompt_eval_count": 19,
+        "eval_count": 8,
+    }
+
+
+class OllamaGeneratorTests(unittest.TestCase):
+    def _model(self):
+        return {
+            "backend": "ollama",
+            "ollama_model": "qwen3.5:2b",
+            "thinking": True,
+            "chat_template_kwargs": {"enable_thinking": True},
+            "temperature": 0.6,
+            "repetition_penalty": 1.0,
+        }
+
+    def _service(self):
+        return {"base_url": "http://127.0.0.1:11434", "num_ctx": 32768}
+
+    def test_verify_requires_the_configured_tag(self):
+        session = FakeSession(get_responses=[FakeResponse(200, {"models": [{"name": "qwen3.5:2b"}]})])
+        adapter = backends.OllamaGenerator(self._model(), self._service(), session=session)
+        self.assertEqual(adapter.verify(), {"model": "qwen3.5:2b", "verified": True})
+        self.assertEqual(session.calls[0][1], "http://127.0.0.1:11434/api/tags")
+        missing = backends.OllamaGenerator(
+            self._model(),
+            self._service(),
+            session=FakeSession(get_responses=[FakeResponse(200, {"models": [{"name": "qwen3.5:9b"}]})]),
+        )
+        with self.assertRaisesRegex(backends.BackendError, "identity"):
+            missing.verify()
+
+    def test_preflight_and_generation_keep_thinking_separate(self):
+        session = FakeSession(
+            get_responses=[FakeResponse(200, {"models": [{"name": "qwen3.5:2b"}]})],
+            post_responses=[FakeResponse(200, ollama_chat()), FakeResponse(200, ollama_chat())],
+        )
+        adapter = backends.OllamaGenerator(self._model(), self._service(), session=session)
+        adapter.verify()
+        messages = [{"role": "user", "content": "Inspect the project."}]
+        self.assertEqual(adapter.count_tokens(messages), 19)
+        result = adapter.generate(messages, seed=12, max_new_tokens=1024, timeout=30)
+        self.assertEqual(result["content"], "Run the focused test suite.")
+        self.assertEqual(result["reasoning"], "Inspect the failing branch first.")
+        self.assertEqual(result["finish_reason"], "stop")
+        self.assertEqual((result["input_tokens"], result["output_tokens"]), (19, 8))
+        preflight = session.calls[1][2]["json"]
+        generation = session.calls[2][2]["json"]
+        self.assertEqual(preflight["options"]["num_predict"], 1)
+        self.assertTrue(preflight["think"])
+        self.assertEqual(generation["options"]["num_predict"], 1024)
+        self.assertEqual(generation["options"]["num_ctx"], 32768)
+        self.assertEqual(generation["options"]["seed"], 12)
+        self.assertEqual(generation["options"]["repeat_penalty"], 1.0)
+        self.assertNotIn("seed", preflight["options"])
+
+    def test_repeated_thinking_stops_the_stream(self):
+        sentence = "The same analysis is being repeated without a command."
+        chunks = []
+        for _ in range(8):
+            chunks.append(json.dumps({"model": "qwen3.5:2b", "message": {"role": "assistant", "content": "", "thinking": sentence + "\n"}, "done": False}))
+        response = FakeResponse(200, {})
+        response.iter_lines = lambda decode_unicode=False: iter(chunks)
+        response.close = lambda: setattr(response, "closed", True)
+        session = FakeSession(
+            get_responses=[FakeResponse(200, {"models": [{"name": "qwen3.5:2b"}]})],
+            post_responses=[response],
+        )
+        adapter = backends.OllamaGenerator(self._model(), self._service(), session=session)
+        adapter.verify()
+        result = adapter.generate([{"role": "user", "content": "x"}], seed=1, max_new_tokens=1000, timeout=5)
+        self.assertEqual(result["finish_reason"], "repetition")
+        self.assertEqual(result["content"], "")
+        self.assertTrue(response.closed)
+        self.assertTrue(backends.thinking_is_looping((sentence + "\n") * 6))
+        self.assertFalse(backends.thinking_is_looping("Look at the source.\nRun the test.\n"))
 
 
 class BuilderTests(unittest.TestCase):

@@ -38,6 +38,10 @@
 
 两组都自行加载固定 revision 的权重与原生模型代码。[官方公共 API 文档](https://decision.vllm-sr.ai/docs#models) 在 2026-10-24 的核查记录中将公共名称 `vllm-sr/d3` 指向 `d3-turbo`；公共 alias 因此不能证明加载了本研究指定的原版 d3。运行器应核对本地 snapshot SHA、原生 manifest 和加载记录。
 
+## 当前部署
+
+2026-10-27：大监督小的小生成器改为 Ollama `qwen3.5:2b`，不再用 Qwen3.5-9B 的 vLLM 服务。大选择器仍是下面固定的 `vllm-sr/d3@cbff3a3cb0b074b6585fe9f747b9f9f5557a0e75`，用原生 `system_one` 加载。`qwen3.5:2b` 是 Q8_0 量化包，不是 d3-flash 声明的 9B 母模型。
+
 ## 双向监督
 
 - 大监督小：D_L（d3 27B 级）选择 G_S（Qwen3.5-9B thinking）的候选补丁。

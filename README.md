@@ -8,7 +8,7 @@
 
 | 角色 | 固定检查点 | GPU 后端 |
 |---|---|---|
-| 小生成器 G_S | Qwen/Qwen3.5-9B | vLLM，原生 thinking 开启，可配 TP |
+| 小生成器 G_S | Ollama `qwen3.5:2b` | Ollama，`think: true`，原生上下文 262144 |
 | 大生成器 G_L | Qwen/Qwen3.8-27B | vLLM，原生 thinking 开启，可配 TP |
 | 小选择器 D_S | vllm-sr/d3-flash，v3.1.0 | 官方原生 `system_one` Choice，单 GPU BF16 |
 | 大选择器 D_L | vllm-sr/d3，v3.1.0 | 官方原生 `system_one` Choice，单 GPU BF16 |
@@ -79,16 +79,16 @@ mkdir -p device-records
 .venv-evaluation/bin/d3study --config configs/gpu.local.json prepare-images --stage debug
 ```
 
-启动小生成器服务器，保持前台运行（建议在 tmux 或集群作业里）：
+启动小生成器。它执行配置里的 Ollama 二进制，并带上 CUDA 兼容库和模型目录。保持前台运行（建议在 tmux 或集群作业里）：
 
 ```bash
-.venv-generator/bin/d3study --config configs/gpu.local.json serve-generator --generator generator_small
+.venv-decision/bin/d3study --config configs/gpu.local.json serve-generator --generator generator_small
 ```
 
-另一个终端执行生成命令。待 `server.log` 显示服务 ready 后启动；若提前连接失败，只需重新发起客户端命令。
+另一个终端执行生成命令。Ollama 的 `/api/tags` 能列出 `qwen3.5:2b` 后再开始；若提前连接失败，只需重新发起客户端命令。
 
 ```bash
-.venv-generator/bin/d3study --config configs/gpu.local.json generate --stage debug --generator generator_small
+.venv-decision/bin/d3study --config configs/gpu.local.json generate --stage debug --generator generator_small
 ```
 
 完成后对服务器按 Ctrl+C 释放显存，再启动大生成器并在另一终端生成：
@@ -115,7 +115,7 @@ mkdir -p device-records
 
 联调完成后固定依赖构建、硬件映射、提示、上下文/输出预算、超时、采样参数、精度、失败策略和总资源预算。用各环境的 `pip freeze` 留存依赖；先检查文件没有私有带凭据 URL，再分享。`doctor` 只输出选定包的版本和凭据是否存在，不输出凭据值。
 
-当前默认生成上下文 32768、每回复最多 16384 输出 token（包含 thinking）、每轨迹最多 131072 输出 token/100 步/3600 秒；选择器公共输入预算 32768 token。这是研究预算，不是模型能力上限。若需要更长上下文，应在 debug 前调高并测显存；不要在 50 题中途更改。历史仅按完整 assistant/observation 对裁剪，首条任务保留；决策器完整 issue/diff 超预算则记 context failure，不截断补丁。
+小生成器和两个选择器都使用模型原生上下文 262144。没有每次回复或每条轨迹的 token 上限；一次回复用掉提示之外剩下的上下文，已完成的命令和观察会保留。只有提示本身超出原生上下文时，才按完整 assistant/observation 对从最早一轮裁剪。单次请求超时 14400 秒，单条轨迹墙钟 86400 秒。决策输入超过原生上下文则记 context failure，不截断补丁。
 
 先执行 `prepare-data --stage pilot`、`prepare-images --stage pilot`，再按上节的相同顺序依次执行两次 `generate`、两次 `select`、`evaluate`、`analyze`，将 `--stage debug` 改为 `--stage pilot`。`serve-generator` 不区分阶段。各阶段命令均显式发起，不会在 debug 之后自动启动 pilot。
 

@@ -11,7 +11,7 @@ dependencies = ["requests>=2.32,<3", "huggingface-hub>=0.34,<2"]
 
 [project.optional-dependencies]
 data = ["datasets>=3,<6"]
-generator = ["vllm"]
+generator = ["requests>=2.32,<3"]
 decision = ["transformers==5.17.0", "torch", "torchvision", "accelerate", "safetensors", "pillow", "opencv-python-headless"]
 evaluation = ["swebench==5.0.2"]
 
