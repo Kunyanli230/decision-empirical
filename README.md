@@ -1,8 +1,6 @@
 # 双向决策监督的 empirical study：轨迹级 Best-of-3
 
-本项目已提供 GPU 推理、容器内解题、共享候选池、双选择器、官方评测和汇总分析的运行代码。**本机只做 CPU 模拟测试，未下载权重、未启动 GPU 推理、未运行真实实验。**真实兼容性和显存峰值须在目标设备的 1–2 题联调中验收。
-
-目标平台为 **Linux x86_64 + NVIDIA CUDA / BF16 GPU + Docker**。运行路径、GPU 编号、TP、缓存、容器资源和评测并发全部由配置指定，不使用当前 Windows 电脑的配置。迁移前填写 [新设备确认清单](NEW_DEVICE_CHECKLIST.md)。
+实验平台为 **A800 80Gb显存 + Docker**。运行路径、GPU 编号、TP、缓存、容器资源和评测并发全部由配置指定，不使用当前 Windows 电脑的配置。迁移前填写 [新设备确认清单](NEW_DEVICE_CHECKLIST.md)。
 
 ## 实验设置
 
